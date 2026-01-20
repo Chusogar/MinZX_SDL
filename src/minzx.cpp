@@ -415,13 +415,13 @@ void MinZX::addressOnBus(uint16_t address, int32_t wstates)
 }
 
 /* Clocks needed for processing INT and NMI */
-void MinZX::interruptHandlingTime(int32_t wstates)
+/*void MinZX::interruptHandlingTime(int32_t wstates)
 {
 	tstates += wstates;
 	intPending = false;
-}
+}*/
 
 /* Callback called when emulation is complete */
-void MinZX::execDone(void)
+/*void MinZX::execDone(void)
 {
-}
+}*/

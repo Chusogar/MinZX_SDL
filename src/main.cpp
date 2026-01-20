@@ -39,8 +39,9 @@ int main(int argc, char *argv[])
 		"SDL2",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
 //		960, 720,
-		1280, 960,
+//		1280, 960,
 //		2560, 1920,
+		320, 240,
 		SDL_WINDOW_SHOWN
 		);
 
