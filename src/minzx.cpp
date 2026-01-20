@@ -57,8 +57,8 @@ uint32_t MinZX::zxColor(int c, bool bright)
 const double CLOCK_FREQ = 3500000.0;
 const int    AUDIO_SAMPLE_RATE = 44100;
 const double TSTATES_PER_SAMPLE = CLOCK_FREQ / AUDIO_SAMPLE_RATE;
-const int16_t HIGH_LEVEL = 20000;
-const int16_t LOW_LEVEL = -20000;
+const int16_t HIGH_LEVEL = 6000;
+const int16_t LOW_LEVEL = -6000;
 const double FILTER_ALPHA = 0.5;
 
 void MinZX::init()
@@ -112,6 +112,9 @@ void MinZX::reset()
     currentVideoAddress = 0;
 }
 
+int _num_frames = 0;
+bool _flash_act = false;
+
 void MinZX::update(uint8_t* screen)
 {
     screenPtr = screen;
@@ -123,7 +126,6 @@ void MinZX::update(uint8_t* screen)
     isInVisibleArea = false;
     currentVideoAddress = 0;
 
-    intPending = true;
     lastTstate = 0;
 
     while (tstates < cycleTstates)
@@ -137,6 +139,13 @@ void MinZX::update(uint8_t* screen)
         }
     }
 
+    _num_frames++;
+
+    if (_num_frames == 16) {   // FLASH ~ 1.56 Hz (50/32 ≈ 1.56)
+        _num_frames = 0;
+        _flash_act = !_flash_act;
+    }
+
     flushAudioBuffer(cycleTstates);
     applyLowPassFilter();
 
@@ -145,6 +154,9 @@ void MinZX::update(uint8_t* screen)
         renderScanline();
         currentScanline++;
     }
+
+    intPending = true;
+
 
     tstates -= cycleTstates;
 }
@@ -190,8 +202,17 @@ void MinZX::renderScanline()
             int pap = (att >> 3) & 7;
             bool br = (att & 0x40) != 0;
 
-            uint32_t fore = zxColor(ink, br);
-            uint32_t back = zxColor(pap, br);
+            uint32_t fore = 0;
+            uint32_t back = 0;
+
+            if (((att & 0x80) == 0) || (_flash_act == 0)) {
+                fore = zxColor(ink, br);
+                back = zxColor(pap, br);
+            } else {
+                fore = zxColor(pap, br);
+                back = zxColor(ink, br);
+            }
+                       
 
             int px = 32 + charX * 8;
             for (int bit = 7; bit >= 0; bit--)
@@ -213,10 +234,9 @@ void MinZX::flushAudioBuffer(uint32_t upToTstate)
     fractional = delta_samples + fractional - static_cast<double>(num_samples);
 
     int16_t level = speakerLevel ? HIGH_LEVEL : LOW_LEVEL;
-    for (int i = 0; i < num_samples; ++i)
+    for (int i = 0; i < num_samples; ++i) {
         audioBuffer.push_back(level);
-
-    lastTstate = upToTstate;
+    }
 }
 
 void MinZX::applyLowPassFilter()

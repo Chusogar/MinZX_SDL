@@ -40,9 +40,11 @@ int main(int argc, char* argv[])
     want.samples = 1024;
     want.callback = nullptr;
 
-    if (SDL_OpenAudio(&want, &have) < 0)
+    SDL_AudioDeviceID audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FORMAT_CHANGE);
+
+    if (audio_dev == 0)
         std::cerr << "Audio error: " << SDL_GetError() << "\n";
-    SDL_PauseAudio(0);
+    SDL_PauseAudioDevice(audio_dev, 0);
 
     const int TEX_W = 320;
     const int TEX_H = 240;
@@ -130,7 +132,9 @@ int main(int argc, char* argv[])
         const auto& abuf = zx.getAudioBuffer();
         if (!abuf.empty())
         {
-            SDL_QueueAudio(1, abuf.data(), static_cast<uint32_t>(abuf.size() * sizeof(int16_t)));
+			//printf("Queuing %zu audio samples\n", abuf.size());
+
+            SDL_QueueAudio(audio_dev, abuf.data(), static_cast<uint32_t>(abuf.size() * sizeof(int16_t)));
             zx.clearAudioBuffer();
         }
 
