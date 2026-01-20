@@ -1,427 +1,442 @@
-#include "minzx.h"
+﻿#include "minzx.h"
 #include "z80.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <memory.h>
+#include <vector>
 
-#define TRACE  printf
-#define DEBUG  printf
-#define LOG    printf
-#define INFO   printf
-#define NOTICE printf
-#define WARN   printf
-#define ERROR  printf
-#define FATAL  printf
+#define TRACE   printf
+#define DEBUG   printf
+#define LOG     printf
+#define INFO    printf
+#define NOTICE  printf
+#define WARN    printf
+#define ERROR   printf
+#define FATAL   printf
 
-
-#define VAL_BRIGHT 255
+#define VAL_BRIGHT    255
 #define VAL_NO_BRIGHT 176
 
 uint32_t speColors[16];
 
 static void createSpectrumColors()
 {
-	uint32_t A = 0xFF000000;
-	uint32_t r = VAL_NO_BRIGHT << 16;
-	uint32_t g = VAL_NO_BRIGHT << 8;
-	uint32_t b = VAL_NO_BRIGHT;
-	uint32_t R = VAL_BRIGHT << 16;
-	uint32_t G = VAL_BRIGHT << 8;
-	uint32_t B = VAL_BRIGHT;
-	speColors[ 0] = A            ;
-	speColors[ 1] = A |         b;
-	speColors[ 2] = A | r        ;
-	speColors[ 3] = A | r |     b;
-	speColors[ 4] = A |     g    ;
-	speColors[ 5] = A |     g | b;
-	speColors[ 6] = A | r | g    ;
-	speColors[ 7] = A | r | g | b;
-	speColors[ 8] = A;
-	speColors[ 9] = A |         B;
-	speColors[10] = A | R        ;
-	speColors[11] = A | R |     B;
-	speColors[12] = A |     G    ;
-	speColors[13] = A |     G | B;
-	speColors[14] = A | R | G    ;
-	speColors[15] = A | R | G | B;
+    uint32_t A = 0xFF000000;
+    uint32_t r = VAL_NO_BRIGHT << 16;
+    uint32_t g = VAL_NO_BRIGHT << 8;
+    uint32_t b = VAL_NO_BRIGHT;
+    uint32_t R = VAL_BRIGHT << 16;
+    uint32_t G = VAL_BRIGHT << 8;
+    uint32_t B = VAL_BRIGHT;
+
+    speColors[0] = A;
+    speColors[1] = A | b;
+    speColors[2] = A | r;
+    speColors[3] = A | r | b;
+    speColors[4] = A | g;
+    speColors[5] = A | g | b;
+    speColors[6] = A | r | g;
+    speColors[7] = A | r | g | b;
+    speColors[8] = A;
+    speColors[9] = A | B;
+    speColors[10] = A | R;
+    speColors[11] = A | R | B;
+    speColors[12] = A | G;
+    speColors[13] = A | G | B;
+    speColors[14] = A | R | G;
+    speColors[15] = A | R | G | B;
 }
 
-static uint32_t zxColor(int c, bool b)
+uint32_t MinZX::zxColor(int c, bool bright)
 {
-	c = c & 7;
-	if (b) c += 8;
-	return speColors[c];
+    c &= 7;
+    if (bright) c += 8;
+    return speColors[c];
 }
 
+const double CLOCK_FREQ = 3500000.0;
+const int    AUDIO_SAMPLE_RATE = 44100;
+const double TSTATES_PER_SAMPLE = CLOCK_FREQ / AUDIO_SAMPLE_RATE;
+const int16_t HIGH_LEVEL = 20000;
+const int16_t LOW_LEVEL = -20000;
+const double FILTER_ALPHA = 0.5;
 
 void MinZX::init()
 {
-	z80   = new Z80(this);
-	mem   = new uint8_t[0x10000];
-	ports = new uint8_t[0x10000];
+    z80 = new Z80(this);
+    mem = new uint8_t[0x10000];
+    ports = new uint8_t[0x10000];
 
-	memset(mem, 0x00, 0x10000);
-	memset(ports, 0xFF, 0x10000);
-	memset(keymatrix, 0xFF, sizeof(keymatrix));
+    memset(mem, 0x00, 0x10000);
+    memset(ports, 0xFF, 0x10000);
+    memset(keymatrix, 0xFF, sizeof(keymatrix));
 
-	cycleTstates = 69888;
-	loadROM();
+    cycleTstates = 69888;
+    loadROM();
 
-	//loadDump();
-	createSpectrumColors();
+    createSpectrumColors();
 
-	intPending = false;
+    intPending = false;
+    speakerLevel = false;
+    lastTstate = 0;
+    fractional = 0.0;
+    currentScanline = 0;
+    tstatesThisLine = 0;
+    ulaFetchPhase = -1;
+    isInVisibleArea = false;
+    currentVideoAddress = 0;
 
-	reset();
+    reset();
 }
 
 void MinZX::reset()
 {
-	border = 7;
-	z80->reset();
+    border = 7;
+    z80->reset();
 
-	ports[0x001F] = 0;
-	ports[0x011F] = 0;
+    ports[0x001F] = 0;
+    ports[0x011F] = 0;
 
-	memset(keymatrix, 0xFF, sizeof(keymatrix));
-	intPending = false;
+    memset(keymatrix, 0xFF, sizeof(keymatrix));
+    intPending = false;
+
+    speakerLevel = false;
+    lastTstate = 0;
+    fractional = 0.0;
+    audioBuffer.clear();
+
+    currentScanline = 0;
+    tstatesThisLine = 0;
+    ulaFetchPhase = -1;
+    isInVisibleArea = false;
+    currentVideoAddress = 0;
 }
 
 void MinZX::update(uint8_t* screen)
 {
-	tstates = 0;
-	uint32_t prevTstates = 0;
+    screenPtr = screen;
 
-	intPending = true;  // Genera IRQ al inicio del frame
+    tstates = 0;
+    currentScanline = 0;
+    tstatesThisLine = 0;
+    ulaFetchPhase = -1;
+    isInVisibleArea = false;
+    currentVideoAddress = 0;
 
-	while (tstates < cycleTstates)
-	{
-		z80->execute();
-		prevTstates = tstates;
-	}
+    intPending = true;
+    lastTstate = 0;
 
-	generateScreen(screen);
+    while (tstates < cycleTstates)
+    {
+        z80->execute();
 
-	tstates -= cycleTstates;
+        while (tstates >= (currentScanline + 1) * TSTATES_PER_SCANLINE)
+        {
+            renderScanline();
+            currentScanline++;
+        }
+    }
+
+    flushAudioBuffer(cycleTstates);
+    applyLowPassFilter();
+
+    while (currentScanline < TOTAL_SCANLINES)
+    {
+        renderScanline();
+        currentScanline++;
+    }
+
+    tstates -= cycleTstates;
 }
 
-void MinZX::destroy()
+void MinZX::renderScanline()
 {
-	delete z80;
-	delete[] mem;
+    if (currentScanline < 0 || currentScanline >= TOTAL_SCANLINES)
+        return;
+
+    uint32_t borderColor = zxColor(border, false);
+
+    int displayY = currentScanline - (TOP_BORDER_LINES - 24);
+    if (displayY < 0 || displayY >= 240)
+        return;
+
+    uint32_t* linePtr = (uint32_t*)(screenPtr + displayY * 320 * 4);
+
+    if (currentScanline < TOP_BORDER_LINES || currentScanline >= TOP_BORDER_LINES + VISIBLE_LINES)
+    {
+        for (int x = 0; x < 320; x++)
+            linePtr[x] = borderColor;
+    }
+    else
+    {
+        int speY = currentScanline - TOP_BORDER_LINES;
+        int ulaY = ((speY & 0xC0) | ((speY & 0x38) >> 3) | ((speY & 0x07) << 3));
+
+        int bmpBase = 0x4000 + (ulaY << 5);
+        int attBase = 0x5800 + ((speY >> 3) << 5);
+
+        uint8_t* bmpPtr = mem + bmpBase;
+        uint8_t* attPtr = mem + attBase;
+
+        for (int x = 0; x < 32; x++)
+            linePtr[x] = borderColor;
+
+        for (int charX = 0; charX < 32; charX++)
+        {
+            uint8_t bmp = bmpPtr[charX];
+            uint8_t att = attPtr[charX];
+
+            int ink = att & 7;
+            int pap = (att >> 3) & 7;
+            bool br = (att & 0x40) != 0;
+
+            uint32_t fore = zxColor(ink, br);
+            uint32_t back = zxColor(pap, br);
+
+            int px = 32 + charX * 8;
+            for (int bit = 7; bit >= 0; bit--)
+                linePtr[px++] = (bmp & (1 << bit)) ? fore : back;
+        }
+
+        for (int x = 32 + 256; x < 320; x++)
+            linePtr[x] = borderColor;
+    }
 }
 
-void MinZX::loadROM()
+void MinZX::flushAudioBuffer(uint32_t upToTstate)
 {
-	FILE* pf = fopen("zx48.rom", "rb");
-	if (pf == NULL) {
-		ERROR("Cannot load ROM from file\n");
-		return;
-	}
+    if (upToTstate <= lastTstate) return;
 
-	size_t elemsRead = fread(mem, 0x4000, 1, pf);
+    uint32_t delta_t = upToTstate - lastTstate;
+    double delta_samples = static_cast<double>(delta_t) / TSTATES_PER_SAMPLE;
+    int num_samples = static_cast<int>(delta_samples + fractional);
+    fractional = delta_samples + fractional - static_cast<double>(num_samples);
+
+    int16_t level = speakerLevel ? HIGH_LEVEL : LOW_LEVEL;
+    for (int i = 0; i < num_samples; ++i)
+        audioBuffer.push_back(level);
+
+    lastTstate = upToTstate;
 }
 
-void MinZX::loadDump()
+void MinZX::applyLowPassFilter()
 {
-	FILE* pf = fopen("mm_mem_dump", "rb");
-	if (pf == NULL) {
-		ERROR("Cannot load dump from file\n");
-		return;
-	}
+    if (audioBuffer.empty()) return;
 
-	size_t elemsRead = fread(mem, 0x10000, 1, pf);
+    int16_t prev = 0;
+    for (auto& sample : audioBuffer)
+    {
+        sample = static_cast<int16_t>(FILTER_ALPHA * sample + (1.0 - FILTER_ALPHA) * prev);
+        prev = sample;
+    }
 }
 
-#define WSCR 320
-#define HSCR 240
-#define WBMP 256
-#define HBMP 192
-#define WBOR 32
-#define HBOR 24
-
-// BGRA
-
-#define ULA_SWAP(y) ((y & 0xC0) | ((y & 0x38) >> 3) | ((y & 0x07) << 3))
-
-void MinZX::generateScreen(uint8_t* screen)
+void MinZX::updateULAFetchState()
 {
-	uint8_t* bptr = screen;
-	uint32_t* dptr = (uint32_t*)bptr;
+    uint32_t tInLine = tstates % TSTATES_PER_SCANLINE;
 
-	//               AARRGGBB
-	uint32_t blk = 0xFF000000;
-	uint32_t whi = 0xFFFFFFFF;
+    if (currentScanline < TOP_BORDER_LINES || currentScanline >= TOP_BORDER_LINES + VISIBLE_LINES)
+    {
+        isInVisibleArea = false;
+        ulaFetchPhase = -1;
+        currentVideoAddress = 0;
+        return;
+    }
 
-	uint32_t borderColor = zxColor(border, 0);
+    isInVisibleArea = true;
 
-	for (int scrY = 0; scrY < HSCR; scrY++)
-	{
-		if (scrY < HBOR)
-		{
-			for (int scrX = 0; scrX < WSCR; scrX++)
-			{
-				*dptr++ = borderColor;
-			}
-		}
-		else if (scrY < HBOR + HBMP)
-		{
-			int speY = scrY - HBOR;
-			int ulaY = ULA_SWAP(speY);
+    if (tInLine >= TSTATES_ACTIVE_FETCH)
+    {
+        ulaFetchPhase = -1;
+        currentVideoAddress = 0;
+        return;
+    }
 
-			int bmpoff = 0x4000 + ( ulaY       << 5);
-			int attoff = 0x5800 + ((speY >> 3) << 5);
-			uint8_t* bmpptr = mem + bmpoff;
-			uint8_t* attptr = mem + attoff;
+    int slot = tInLine / 8;
+    int subT = tInLine % 8;
 
-			for (int scrX = 0; scrX < WSCR; scrX++)
-			{
-				if (scrX < WBOR)
-				{
-					*dptr++ = borderColor;
-				}
-				else if (scrX < WBOR + WBMP)
-				{
-					int speX = scrX - WBOR;
+    if (subT >= 4)
+    {
+        ulaFetchPhase = -1;
+        currentVideoAddress = 0;
+        return;
+    }
 
-					uint8_t bmp = *bmpptr++;
-					uint8_t att = *attptr++;
+    ulaFetchPhase = slot;
 
-					int ink = (att)      & 7;
-					int pap = (att >> 3) & 7;
-					int bri = (att >> 6) & 1;
-					int fla = (att >> 7);
-					uint32_t fore = zxColor(ink, bri);
-					uint32_t back = zxColor(pap, bri);
+    int charX = slot * 2 + (subT / 2);
+    bool isAttr = (subT % 2) == 1;
 
-					// B & W
-					// uint32_t fore = blk;
-					// uint32_t back = whi;
+    int speY = currentScanline - TOP_BORDER_LINES;
+    int ulaY = ((speY & 0xC0) | ((speY & 0x38) >> 3) | ((speY & 0x07) << 3));
 
-					for (int mask = 0x80; mask > 0; mask >>= 1)
-					{
-						if (mask & bmp)
-							*dptr++ = fore;
-						else
-							*dptr++ = back;
-					}
-
-					scrX += 7;
-				}
-				else
-				{
-					*dptr++ = borderColor;
-				}
-			}
-		}
-		else
-		{
-			for (int scrX = 0; scrX < WSCR; scrX++)
-			{
-				*dptr++ = borderColor;
-			}
-		}
-	}
+    if (isAttr)
+        currentVideoAddress = 0x5800 + ((speY >> 3) << 5) + charX;
+    else
+        currentVideoAddress = 0x4000 + (ulaY << 5) + charX;
 }
 
 uint8_t MinZX::processInputPort(uint16_t port)
 {
-	uint8_t hiport = port >> 8;
-	uint8_t loport = port & 0xFF;
+    uint8_t hi = port >> 8;
+    uint8_t lo = port & 0xFF;
 
-	if (loport == 0xFE) {
-		uint8_t result = 0xFF;  // Bit6=1 (no tape), bit5/7=1, bits0-4=1 si no presionado
+    // Teclado + ULA (puertos pares)
+    if ((lo & 0x01) == 0)
+    {
+        uint8_t result = 0xFF;
 
-		// Manejo del teclado: seleccionar rows basados en bits bajos de hiport (A8-A15)
-		for (int row = 0; row < 8; row++) {
-			if ((hiport & (1 << row)) == 0) {
-				result &= keymatrix[row];
-			}
-		}
+        for (int row = 0; row < 8; row++)
+            if ((hi & (1 << row)) == 0)
+                result &= keymatrix[row];
 
-		return result;
-	}
-	// Kempston
-	if (loport == 0x1F) {
-		return 0x00;
-	}
-	// Sound (AY-3-8912)
+        // EAR (sin tape por ahora)
+        // result &= ~0x40;  // si quieres simular 0/1
 
-	uint8_t data = 0;
-	data |= (0xe0); /* Set bits 5-7 - as reset above */
-	data &= ~0x40;
-	// Serial.printf("Port %x%x  Data %x\n", portHigh,loport,data);
-	return data;
+        return result;
+    }
+
+    // Floating bus para puertos no decodificados (excepto Kempston)
+    if (lo != 0x1F)
+    {
+        updateULAFetchState();
+
+        if (!isInVisibleArea || ulaFetchPhase < 0)
+            return 0xFF;
+
+        return mem[currentVideoAddress];
+    }
+
+    return 0xFF; // Kempston o default
 }
-
 
 void MinZX::processOutputPort(uint16_t port, uint8_t value)
 {
-	uint8_t hiport = port >> 8;
-	uint8_t loport = port & 0xFF;
+    uint8_t lo = port & 0xFF;
 
-	uint8_t tmp_data = value;
-	switch (loport) {
-		case 0xFE: {
+    if (lo == 0xFE)
+    {
+        flushAudioBuffer(tstates);
+        speakerLevel = (value & 0x10) != 0;
+        lastTstate = tstates;
 
-			// delayMicroseconds(CONTENTION_TIME);
-
-			// border color (no bright colors)
-			border = value & 0x07;
-
-#ifdef SPEAKER_PRESENT
-			digitalWrite(SPEAKER_PIN, bitRead(data, 4)); // speaker
-#endif
-
-#ifdef MIC_PRESENT
-			digitalWrite(MIC_PIN, bitRead(data, 3)); // tape_out
-#endif
-
-			//Ports::base[0x20] = data;
-			break;
-		}
-	}
+        border = value & 0x07;
+    }
 }
 
 void MinZX::keyPress(int row, int bit, bool press)
 {
-	if (press) {
-		keymatrix[row] &= ~(1 << bit);
-	} else {
-		keymatrix[row] |= (1 << bit);
-	}
+    if (press)
+        keymatrix[row] &= ~(1 << bit);
+    else
+        keymatrix[row] |= (1 << bit);
 }
 
 bool MinZX::isActiveINT(void)
 {
-	return intPending;
+    return intPending;
 }
 
 void MinZX::interruptHandlingTime(int32_t wstates)
 {
-	tstates += wstates;
-	intPending = false;
+    tstates += wstates;
+    intPending = false;
 }
 
-// sequence of wait states
-static unsigned char wait_states[8] = { 6, 5, 4, 3, 2, 1, 0, 0 };
-
-// delay contention: emulates wait states introduced by the ULA (graphic chip)
-// whenever there is a memory access to contended memory (shared between ULA and CPU).
-// detailed info: https://worldofspectrum.org/faq/reference/48kreference.htm#ZXSpectrum
-// from paragraph which starts with "The 50 Hz interrupt is synchronized with..."
-// if you only read from https://worldofspectrum.org/faq/reference/48kreference.htm#Contention
-// without reading the previous paragraphs about line timings, it may be confusing.
 unsigned char delay_contention(uint16_t address, unsigned int tstates)
 {
-	// delay states one t-state BEFORE the first pixel to be drawn
-	tstates += 1;
-
-	// each line spans 224 t-states
-	int line = tstates / 224;
-
-	// only the 192 lines between 64 and 255 have graphic data, the rest is border
-	if (line < 64 || line >= 256) return 0;
-
-	// only the first 128 t-states of each line correspond to a graphic data transfer
-	// the remaining 96 t-states correspond to border
-	int halfpix = tstates % 224;
-	if (halfpix >= 128) return 0;
-
-	int modulo = halfpix % 8;
-	return wait_states[modulo];
+    tstates += 1;
+    int line = tstates / 224;
+    if (line < 64 || line >= 256) return 0;
+    int halfpix = tstates % 224;
+    if (halfpix >= 128) return 0;
+    int modulo = halfpix % 8;
+    static unsigned char wait_states[8] = { 6,5,4,3,2,1,0,0 };
+    return wait_states[modulo];
 }
 
-#define ADDRESS_IN_LOW_RAM(addr) (1 == (addr >> 14))
-
-/* Read opcode from RAM */
 uint8_t MinZX::fetchOpcode(uint16_t address)
 {
-	// 3 clocks to fetch opcode from RAM and 1 execution clock
-	if (ADDRESS_IN_LOW_RAM(address))
-		tstates += delay_contention(address, tstates);
-
-	tstates += 4;
-	return mem[address];
+    if ((address >> 14) == 1)
+        tstates += delay_contention(address, tstates);
+    tstates += 4;
+    return mem[address];
 }
 
-/* Read/Write byte from/to RAM */
 uint8_t MinZX::peek8(uint16_t address)
 {
-	// 3 clocks for read byte from RAM
-	if (ADDRESS_IN_LOW_RAM(address))
-		tstates += delay_contention(address, tstates);
-
-	tstates += 3;
-	return mem[address];
+    if ((address >> 14) == 1)
+        tstates += delay_contention(address, tstates);
+    tstates += 3;
+    return mem[address];
 }
 
 void MinZX::poke8(uint16_t address, uint8_t value)
 {
-	// 3 clocks for write byte to RAM
-	if (ADDRESS_IN_LOW_RAM(address))
-		tstates += delay_contention(address, tstates);
-
-	tstates += 3;
-	mem[address] = value;
+    if ((address >> 14) == 1)
+        tstates += delay_contention(address, tstates);
+    tstates += 3;
+    mem[address] = value;
 }
 
-/* Read/Write word from/to RAM */
 uint16_t MinZX::peek16(uint16_t address)
 {
-	// Order matters, first read lsb, then read msb, don't "optimize"
-	uint8_t lsb = peek8(address);
-	uint8_t msb = peek8(address + 1);
-	return (msb << 8) | lsb;
+    uint8_t lo = peek8(address);
+    uint8_t hi = peek8(address + 1);
+    return (hi << 8) | lo;
 }
 
 void MinZX::poke16(uint16_t address, RegisterPair word)
 {
-	// Order matters, first write lsb, then write msb, don't "optimize"
-	poke8(address, word.byte8.lo);
-	poke8(address + 1, word.byte8.hi);
+    poke8(address, word.byte8.lo);
+    poke8(address + 1, word.byte8.hi);
 }
 
-/* In/Out byte from/to IO Bus */
 uint8_t MinZX::inPort(uint16_t port)
 {
-	// 4 clocks for read byte from bus
-	tstates += 3;
-
-	// return ports[port];
-	return processInputPort(port);
+    tstates += 3;
+    return processInputPort(port);
 }
 
 void MinZX::outPort(uint16_t port, uint8_t value)
 {
-	// 4 clocks for write byte to bus
-	tstates += 4;
-
-	// ports[port] = value;
-	processOutputPort(port, value);
+    tstates += 4;
+    processOutputPort(port, value);
 }
 
-/* Put an address on bus lasting 'tstates' cycles */
 void MinZX::addressOnBus(uint16_t address, int32_t wstates)
 {
-	// Additional clocks to be added on some instructions
-	if (ADDRESS_IN_LOW_RAM(address)) {
-		for (int idx = 0; idx < wstates; idx++) {
-			tstates += delay_contention(address, tstates) + 1;
-		}
-	} else {
-		tstates += wstates;
-	}
+    if ((address >> 14) == 1)
+    {
+        for (int i = 0; i < wstates; i++)
+            tstates += delay_contention(address, tstates) + 1;
+    }
+    else
+        tstates += wstates;
 }
 
-/* Clocks needed for processing INT and NMI */
-/*void MinZX::interruptHandlingTime(int32_t wstates)
-{
-	tstates += wstates;
-	intPending = false;
-}*/
 
-/* Callback called when emulation is complete */
-/*void MinZX::execDone(void)
+
+void MinZX::loadROM()
 {
-}*/
+    FILE* pf = fopen("zx48.rom", "rb");
+    if (!pf)
+    {
+        ERROR("Cannot load zx48.rom\n");
+        return;
+    }
+    fread(mem, 1, 0x4000, pf);
+    fclose(pf);
+}
+
+void MinZX::loadDump()
+{
+    // opcional - implementación vacía por ahora
+}
+
+void MinZX::destroy()
+{
+    delete z80;
+    delete[] mem;
+    delete[] ports;
+}
