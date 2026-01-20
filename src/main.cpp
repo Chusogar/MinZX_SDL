@@ -98,19 +98,63 @@ int main(int argc, char *argv[])
 				useLocktexture = !useLocktexture;
 				std::cout << "Using " << (useLocktexture ? "SDL_LockTexture() + memcpy()" : "SDL_UpdateTexture()") << std::endl;
 			}
-		}
-
-		// splat down some random pixels
-		for (unsigned int i = 0; i < 1000; i++)
-		{
-			const unsigned int x = rand() % texWidth;
-			const unsigned int y = rand() % texHeight;
-
-			const unsigned int offset = (texWidth * 4 * y) + x * 4;
-			pixels[offset + 0] = rand() % 256;        // b
-			pixels[offset + 1] = rand() % 256;        // g
-			pixels[offset + 2] = rand() % 256;        // r
-			pixels[offset + 3] = SDL_ALPHA_OPAQUE;    // a
+			if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)
+			{
+				bool press = (event.type == SDL_KEYDOWN);
+				int row = -1;
+				int bit = -1;
+				switch (event.key.keysym.sym)
+				{
+				case SDLK_a: row = 1; bit = 0; break;
+				case SDLK_b: row = 7; bit = 4; break;
+				case SDLK_c: row = 0; bit = 3; break;
+				case SDLK_d: row = 1; bit = 2; break;
+				case SDLK_e: row = 2; bit = 2; break;
+				case SDLK_f: row = 1; bit = 3; break;
+				case SDLK_g: row = 1; bit = 4; break;
+				case SDLK_h: row = 6; bit = 4; break;
+				case SDLK_i: row = 5; bit = 2; break;
+				case SDLK_j: row = 6; bit = 3; break;
+				case SDLK_k: row = 6; bit = 2; break;
+				case SDLK_l: row = 6; bit = 1; break;
+				case SDLK_m: row = 7; bit = 2; break;
+				case SDLK_n: row = 7; bit = 3; break;
+				case SDLK_o: row = 5; bit = 1; break;
+				case SDLK_p: row = 5; bit = 0; break;
+				case SDLK_q: row = 2; bit = 0; break;
+				case SDLK_r: row = 2; bit = 3; break;
+				case SDLK_s: row = 1; bit = 1; break;
+				case SDLK_t: row = 2; bit = 4; break;
+				case SDLK_u: row = 5; bit = 3; break;
+				case SDLK_v: row = 0; bit = 4; break;
+				case SDLK_w: row = 2; bit = 1; break;
+				case SDLK_x: row = 0; bit = 2; break;
+				case SDLK_y: row = 5; bit = 4; break;
+				case SDLK_z: row = 0; bit = 1; break;
+				case SDLK_0: row = 4; bit = 0; break;
+				case SDLK_1: row = 3; bit = 0; break;
+				case SDLK_2: row = 3; bit = 1; break;
+				case SDLK_3: row = 3; bit = 2; break;
+				case SDLK_4: row = 3; bit = 3; break;
+				case SDLK_5: row = 3; bit = 4; break;
+				case SDLK_6: row = 4; bit = 4; break;
+				case SDLK_7: row = 4; bit = 3; break;
+				case SDLK_8: row = 4; bit = 2; break;
+				case SDLK_9: row = 4; bit = 1; break;
+				case SDLK_SPACE: row = 7; bit = 0; break;
+				case SDLK_RETURN: row = 6; bit = 0; break;
+				case SDLK_LSHIFT:
+				case SDLK_RSHIFT: row = 0; bit = 0; break;  // Caps Shift
+				case SDLK_LCTRL:
+				case SDLK_RCTRL:
+				case SDLK_LALT:
+				case SDLK_RALT: row = 7; bit = 1; break;  // Symbol Shift
+				}
+				if (row >= 0 && bit >= 0)
+				{
+					minZX.keyPress(row, bit, press);
+				}
+			}
 		}
 
 		minZX.update(&pixels[0]);
@@ -143,7 +187,7 @@ int main(int argc, char *argv[])
 		SDL_RenderCopy(renderer, texture, NULL, NULL);
 		SDL_RenderPresent(renderer);
 
-		SDL_Delay(17);
+		SDL_Delay(20);  // Aproxima 50Hz para ZX Spectrum
 
 		frames++;
 		const Uint64 end = SDL_GetPerformanceCounter();
