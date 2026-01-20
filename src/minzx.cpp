@@ -62,12 +62,15 @@ void MinZX::init()
 
 	memset(mem, 0x00, 0x10000);
 	memset(ports, 0xFF, 0x10000);
+	memset(keymatrix, 0xFF, sizeof(keymatrix));
 
 	cycleTstates = 69888;
 	loadROM();
 
 	//loadDump();
 	createSpectrumColors();
+
+	intPending = false;
 
 	reset();
 }
@@ -79,12 +82,17 @@ void MinZX::reset()
 
 	ports[0x001F] = 0;
 	ports[0x011F] = 0;
+
+	memset(keymatrix, 0xFF, sizeof(keymatrix));
+	intPending = false;
 }
 
 void MinZX::update(uint8_t* screen)
 {
 	tstates = 0;
 	uint32_t prevTstates = 0;
+
+	intPending = true;  // Genera IRQ al inicio del frame
 
 	while (tstates < cycleTstates)
 	{
@@ -222,30 +230,19 @@ uint8_t MinZX::processInputPort(uint16_t port)
 	uint8_t loport = port & 0xFF;
 
 	if (loport == 0xFE) {
-		uint8_t result = 0xFF;
+		uint8_t result = 0xFF;  // Bit6=1 (no tape), bit5/7=1, bits0-4=1 si no presionado
 
-		// EAR_PIN
-		if (hiport == 0xFE) {
-#ifdef EAR_PRESENT
-			bitWrite(result, 6, digitalRead(EAR_PIN));
-#endif
+		// Manejo del teclado: seleccionar rows basados en bits bajos de hiport (A8-A15)
+		for (int row = 0; row < 8; row++) {
+			if ((hiport & (1 << row)) == 0) {
+				result &= keymatrix[row];
+			}
 		}
-
-		// Keyboard
-		//if (~(portHigh | 0xFE) & 0xFF) result &= (Ports::base[0] & Ports::wii[0]);
-		//if (~(portHigh | 0xFD) & 0xFF) result &= (Ports::base[1] & Ports::wii[1]);
-		//if (~(portHigh | 0xFB) & 0xFF) result &= (Ports::base[2] & Ports::wii[2]);
-		//if (~(portHigh | 0xF7) & 0xFF) result &= (Ports::base[3] & Ports::wii[3]);
-		//if (~(portHigh | 0xEF) & 0xFF) result &= (Ports::base[4] & Ports::wii[4]);
-		//if (~(portHigh | 0xDF) & 0xFF) result &= (Ports::base[5] & Ports::wii[5]);
-		//if (~(portHigh | 0xBF) & 0xFF) result &= (Ports::base[6] & Ports::wii[6]);
-		//if (~(portHigh | 0x7F) & 0xFF) result &= (Ports::base[7] & Ports::wii[7]);
 
 		return result;
 	}
 	// Kempston
 	if (loport == 0x1F) {
-		//return Ports::base[31];
 		return 0x00;
 	}
 	// Sound (AY-3-8912)
@@ -284,6 +281,26 @@ void MinZX::processOutputPort(uint16_t port, uint8_t value)
 			break;
 		}
 	}
+}
+
+void MinZX::keyPress(int row, int bit, bool press)
+{
+	if (press) {
+		keymatrix[row] &= ~(1 << bit);
+	} else {
+		keymatrix[row] |= (1 << bit);
+	}
+}
+
+bool MinZX::isActiveINT(void)
+{
+	return intPending;
+}
+
+void MinZX::interruptHandlingTime(int32_t wstates)
+{
+	tstates += wstates;
+	intPending = false;
 }
 
 // sequence of wait states
@@ -392,35 +409,19 @@ void MinZX::addressOnBus(uint16_t address, int32_t wstates)
 		for (int idx = 0; idx < wstates; idx++) {
 			tstates += delay_contention(address, tstates) + 1;
 		}
-	}
-	else
+	} else {
 		tstates += wstates;
+	}
 }
 
 /* Clocks needed for processing INT and NMI */
 void MinZX::interruptHandlingTime(int32_t wstates)
 {
 	tstates += wstates;
+	intPending = false;
 }
 
-/* Callback to know when the INT signal is active */
-bool MinZX::isActiveINT(void)
-{
-	// Put here the needed logic to trigger an INT
-	return false;
-}
-
-#ifdef WITH_BREAKPOINT_SUPPORT
-/* Callback for notify at PC address */
-uint8_t MinZX::breakpoint(uint16_t address, uint8_t opcode)
-{
-}
-
-#endif
-
-#ifdef WITH_EXEC_DONE
-/* Callback to notify that one instruction has ended */
+/* Callback called when emulation is complete */
 void MinZX::execDone(void)
 {
 }
-#endif
