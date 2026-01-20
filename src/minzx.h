@@ -16,7 +16,7 @@ public:
 	void reset();
 
 	void setBorderColor(uint8_t bcol) { border = bcol; }
-	void notifyKey(uint8_t specKey, bool isDown);
+	void keyPress(int row, int bit, bool press);
 
 	// accessors (for loaders)
 	Z80*     getCPU()    { return z80; }
@@ -59,6 +59,8 @@ private:
 	void processOutputPort(uint16_t port, uint8_t value);
 
 	uint8_t border;
+	uint8_t keymatrix[8];
+	bool intPending;
 };
 
 #endif // _MINZX_H_
