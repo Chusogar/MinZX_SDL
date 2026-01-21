@@ -111,7 +111,7 @@ bool FileMgr::loadSNA(const char* filename, MinZX* targetEmulator)
 	z80->setIM((Z80::IntMode)fgetc(pf));
 	targetEmulator->setBorderColor(fgetc(pf));
 
-	//z80->setIFF1(z80->isIFF2());
+	z80->setIFF1(z80->isIFF2());
 	
 	//byte inter = lhandle.read();
 	//_zxCpu.iff2 = (inter & 0x04) ? 1 : 0;
@@ -138,18 +138,13 @@ bool FileMgr::loadSNA(const char* filename, MinZX* targetEmulator)
 	}
 	
 	// Restaurar PC: estaba en la pila (emulación del comportamiento real)
-	uint16_t sp = z80->getRegSP();
-	z80->setRegPC( (mem[sp + 1] << 8) | mem[sp] );
 	uint16_t SP = z80->getRegSP();
+	uint16_t retaddr = targetEmulator->peek16(SP);
+
 	SP += 2;
 	z80->setRegSP(SP);
 
-	// IFF1 suele ser igual a IFF2
-	//cpu.iff1 = cpu.iff2;
-	z80->setIFF1(z80->isIFF2());
-
-	
-	//z80->setRegPC(z80->getRegSP());
+	z80->setRegPC(retaddr);
 
 	fclose(pf);
 

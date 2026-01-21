@@ -57,8 +57,8 @@ uint32_t MinZX::zxColor(int c, bool bright)
 const double CLOCK_FREQ = 3500000.0;
 const int    AUDIO_SAMPLE_RATE = 44100;
 const double TSTATES_PER_SAMPLE = CLOCK_FREQ / AUDIO_SAMPLE_RATE;
-const int16_t HIGH_LEVEL = 6000;
-const int16_t LOW_LEVEL = -6000;
+const int16_t HIGH_LEVEL = 8000;
+const int16_t LOW_LEVEL = -8000;
 const double FILTER_ALPHA = 0.5;
 
 void MinZX::init()
@@ -139,14 +139,12 @@ void MinZX::update(uint8_t* screen)
         }
     }
 
-    _num_frames++;
-
     if (_num_frames == 16) {   // FLASH ~ 1.56 Hz (50/32 ≈ 1.56)
         _num_frames = 0;
         _flash_act = !_flash_act;
     }
 
-    flushAudioBuffer(cycleTstates);
+    //flushAudioBuffer(cycleTstates);
     applyLowPassFilter();
 
     while (currentScanline < TOTAL_SCANLINES)

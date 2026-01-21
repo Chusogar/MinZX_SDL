@@ -25,7 +25,10 @@ int main(int argc, char* argv[])
     FileMgr fm;
     if (argc > 1) fm.loadSNA(argv[1], &zx);
 
-    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+        std::cerr << "SDL_Init error: " << SDL_GetError() << "\n";
+        return 1;
+    }
 
     SDL_Window* window = SDL_CreateWindow("MinZX SDL", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         320, 240, SDL_WINDOW_SHOWN);
@@ -40,11 +43,23 @@ int main(int argc, char* argv[])
     want.samples = 1024;
     want.callback = nullptr;
 
-    SDL_AudioDeviceID audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FORMAT_CHANGE);
+    // Request the exact format (do not allow SDL to change it automatically).
+    SDL_AudioDeviceID audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
 
-    if (audio_dev == 0)
+    if (audio_dev == 0) {
         std::cerr << "Audio error: " << SDL_GetError() << "\n";
-    SDL_PauseAudioDevice(audio_dev, 0);
+    } else {
+        if (have.format != want.format || have.channels != want.channels || have.freq != want.freq) {
+            std::cerr << "Warning: audio device opened with different format than requested.\n";
+            std::cerr << "Requested: freq=" << want.freq << " fmt=" << want.format << " ch=" << (int)want.channels << "\n";
+            std::cerr << "Got:       freq=" << have.freq << " fmt=" << have.format << " ch=" << (int)have.channels << "\n";
+            // We requested exact format (flags=0). If device still differs, you must convert samples before queuing.
+            // For now, if formats differ we will still try to queue int16 samples, but best is to reopen device with a supported format or convert.
+        }
+
+        // Start the audio device
+        SDL_PauseAudioDevice(audio_dev, 0);
+    }
 
     const int TEX_W = 320;
     const int TEX_H = 240;
@@ -130,10 +145,9 @@ int main(int argc, char* argv[])
         zx.update(pixels.data());
 
         const auto& abuf = zx.getAudioBuffer();
-        if (!abuf.empty())
+        if (!abuf.empty() && audio_dev != 0)
         {
-			//printf("Queuing %zu audio samples\n", abuf.size());
-
+            // Queue int16 samples (device was requested with AUDIO_S16SYS).
             SDL_QueueAudio(audio_dev, abuf.data(), static_cast<uint32_t>(abuf.size() * sizeof(int16_t)));
             zx.clearAudioBuffer();
         }
@@ -157,7 +171,10 @@ int main(int argc, char* argv[])
         }
     }
 
-    SDL_CloseAudio();
+    // Close audio device if opened
+    if (audio_dev != 0)
+        SDL_CloseAudioDevice(audio_dev);
+
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
