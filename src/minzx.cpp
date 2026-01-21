@@ -144,6 +144,8 @@ void MinZX::update(uint8_t* screen)
         _flash_act = !_flash_act;
     }
 
+    _num_frames++;
+
     //flushAudioBuffer(cycleTstates);
     applyLowPassFilter();
 
