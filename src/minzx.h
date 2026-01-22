@@ -4,6 +4,10 @@
 #include <inttypes.h>
 #include <vector>
 #include "z80.h"
+//#include "tzxplayer.h"
+#include "tape.h"
+
+
 
 class MinZX : public Z80operations
 {
@@ -12,39 +16,55 @@ public:
     void update(uint8_t* screen);
     void destroy();
     void reset();
+    // Avanza tstates y notifica al reproductor de cinta
+    void addTstates(uint32_t delta);
 
     void setBorderColor(uint8_t bcol) { border = bcol; }
     void keyPress(int row, int bit, bool press);
 
-    Z80*     getCPU()    { return z80; }
+    Z80* getCPU() { return z80; }
     uint8_t* getMemory() { return mem; }
 
     const std::vector<int16_t>& getAudioBuffer() const { return audioBuffer; }
     void clearAudioBuffer() { audioBuffer.clear(); }
 
+    // Tape player control
+    /*void setTapePlayer(TzxPlayer* p) { tapePlayer = p; }
+    TzxPlayer* getTapePlayer() { return tapePlayer; }
+
+    void playTape() { if (tapePlayer) tapePlaying = true; }
+    void stopTape() { tapePlaying = false; }
+    void rewindTape() { if (tapePlayer) { tapePlayer->rewind(); tapePlaying = false; } }
+    bool isTapePlaying() const { return tapePlaying; }
+    */
+
 public:
-    virtual uint8_t  fetchOpcode (uint16_t address);
-    virtual uint8_t  peek8       (uint16_t address);
-    virtual void     poke8       (uint16_t address, uint8_t value);
-    virtual uint16_t peek16      (uint16_t address);
-    virtual void     poke16      (uint16_t address, RegisterPair word);
-    virtual uint8_t  inPort      (uint16_t port);
-    virtual void     outPort     (uint16_t port, uint8_t value);
+    virtual uint8_t  fetchOpcode(uint16_t address);
+    virtual uint8_t  peek8(uint16_t address);
+    virtual void     poke8(uint16_t address, uint8_t value);
+    virtual uint16_t peek16(uint16_t address);
+    virtual void     poke16(uint16_t address, RegisterPair word);
+    virtual uint8_t  inPort(uint16_t port);
+    virtual void     outPort(uint16_t port, uint8_t value);
     virtual void     addressOnBus(uint16_t address, int32_t wstates);
     virtual void     interruptHandlingTime(int32_t wstates);
-    virtual bool     isActiveINT (void);
+    virtual bool     isActiveINT(void);
 #ifdef WITH_BREAKPOINT_SUPPORT
-    virtual uint8_t  breakpoint  (uint16_t address, uint8_t opcode);
+    virtual uint8_t  breakpoint(uint16_t address, uint8_t opcode);
 #endif
 #ifdef WITH_EXEC_DONE
     virtual void     execDone(void);
 #endif
+
+    Tape tape;
 
 private:
     Z80* z80;
     uint8_t* mem;
     uint8_t* ports;
     uint32_t tstates;
+    // helper para notificar a cinta cuando avanza tstates
+    void addTstatesImpl(uint32_t delta);
 
     uint32_t cycleTstates;
 
@@ -70,7 +90,7 @@ private:
     // Scanline-based rendering
     int currentScanline;          // 0..311
     uint32_t tstatesThisLine;
-    uint8_t* screenPtr;           // buffer ARGB8888 320×240
+    uint8_t* screenPtr;           // buffer ARGB8888 320x240
 
     void renderScanline();
     uint32_t zxColor(int c, bool bright);
@@ -82,12 +102,16 @@ private:
 
     void updateULAFetchState();
 
-    static const int TOTAL_SCANLINES       = 312;
-    static const int TOP_BORDER_LINES      = 64;
-    static const int VISIBLE_LINES         = 192;
-    static const int TSTATES_PER_SCANLINE  = 224;
-    static const int FETCH_SLOTS_PER_LINE  = 16;
-    static const int TSTATES_ACTIVE_FETCH  = 128;
+    // Tape player pointer (MinZX owns it) + playing flag
+    //TzxPlayer* tapePlayer = nullptr;
+    bool tapePlaying = false;
+
+    static const int TOTAL_SCANLINES = 312;
+    static const int TOP_BORDER_LINES = 64;
+    static const int VISIBLE_LINES = 192;
+    static const int TSTATES_PER_SCANLINE = 224;
+    static const int FETCH_SLOTS_PER_LINE = 16;
+    static const int TSTATES_ACTIVE_FETCH = 128;
 };
 
 #endif // _MINZX_H_

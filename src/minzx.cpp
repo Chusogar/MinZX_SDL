@@ -5,6 +5,9 @@
 #include <memory.h>
 #include <vector>
 
+#include "tape/tape_stream.h"
+#include "tape/tap_loader.h"
+
 #define TRACE   printf
 #define DEBUG   printf
 #define LOG     printf
@@ -86,7 +89,21 @@ void MinZX::init()
     isInVisibleArea = false;
     currentVideoAddress = 0;
 
+    // Inicializa el reproductor de cinta a nullptr (se puede asignar con FileMgr)
+    //tapePlayer = nullptr;
+    tapePlaying = false;
+
     reset();
+}
+
+// Incrementa tstates y notifica al TzxPlayer si está reproduciendo
+void MinZX::addTstates(uint32_t delta)
+{
+    if (delta == 0) return;
+    tstates += delta;
+    /*if (tapePlayer && tapePlaying) {
+        tapePlayer->advanceByTstates(delta);
+    }*/
 }
 
 void MinZX::reset()
@@ -110,7 +127,58 @@ void MinZX::reset()
     ulaFetchPhase = -1;
     isInVisibleArea = false;
     currentVideoAddress = 0;
+
+    //if (tapePlayer) tapePlayer->rewind();
+    tapePlaying = false;
 }
+
+
+// --- Tape driver simple ---
+static TapeStream* sTape = nullptr;
+static size_t sTapeIdx = 0;         // índice del pulso actual
+static uint32_t sTapeUsLeft = 0;    // microsegundos restantes del pulso actual
+static bool sEarLevel = true;       // alterna con cada semionda
+
+void Tape_Attach(TapeStream* t) {
+    sTape = t;
+    sTapeIdx = 0;
+    sTapeUsLeft = 0;
+    sEarLevel = true;
+}
+
+inline void Tape_StepUS(uint32_t us_step) {
+    if (!sTape || sTape->pulses.empty()) return;
+    while (us_step > 0) {
+        if (sTapeIdx >= sTape->pulses.size()) return;
+
+        if (sTapeUsLeft == 0) {
+            sTapeUsLeft = sTape->pulses[sTapeIdx].us;
+            if (sTapeUsLeft == 0) {
+                // Pausa: consume y avanza
+                sTapeIdx++;
+                continue;
+            }
+        }
+
+        if (us_step >= sTapeUsLeft) {
+            us_step -= sTapeUsLeft;
+            sTapeUsLeft = 0;
+            sTapeIdx++;
+            // Borde: alterna nivel
+            sEarLevel = !sEarLevel;
+        }
+        else {
+            sTapeUsLeft -= us_step;
+            us_step = 0;
+        }
+    }
+}
+
+inline bool Tape_GetEAR() {
+    // Convención: true = tono presente → bit 6 = 0 (línea baja en EAR)
+    return sEarLevel;
+}
+
 
 int _num_frames = 0;
 bool _flash_act = false;
@@ -131,11 +199,16 @@ void MinZX::update(uint8_t* screen)
     while (tstates < cycleTstates)
     {
         z80->execute();
+        //tape.advance(10);
 
         while (tstates >= (currentScanline + 1) * TSTATES_PER_SCANLINE)
         {
             renderScanline();
             currentScanline++;
+
+            tape.advance(224);
+            //flushAudioBuffer(224);
+            //applyLowPassFilter();
         }
     }
 
@@ -147,13 +220,16 @@ void MinZX::update(uint8_t* screen)
     _num_frames++;
 
     //flushAudioBuffer(cycleTstates);
+    //tape.advance(6998);
     applyLowPassFilter();
 
-    while (currentScanline < TOTAL_SCANLINES)
+    //tape.advance(tstates);
+
+    /*while (currentScanline < TOTAL_SCANLINES)
     {
         renderScanline();
         currentScanline++;
-    }
+    }*/
 
     intPending = true;
 
@@ -208,11 +284,12 @@ void MinZX::renderScanline()
             if (((att & 0x80) == 0) || (_flash_act == 0)) {
                 fore = zxColor(ink, br);
                 back = zxColor(pap, br);
-            } else {
+            }
+            else {
                 fore = zxColor(pap, br);
                 back = zxColor(ink, br);
             }
-                       
+
 
             int px = 32 + charX * 8;
             for (int bit = 7; bit >= 0; bit--)
@@ -233,9 +310,23 @@ void MinZX::flushAudioBuffer(uint32_t upToTstate)
     int num_samples = static_cast<int>(delta_samples + fractional);
     fractional = delta_samples + fractional - static_cast<double>(num_samples);
 
-    int16_t level = speakerLevel ? HIGH_LEVEL : LOW_LEVEL;
+    int16_t beeperLevel = speakerLevel ? HIGH_LEVEL : LOW_LEVEL;
+
+    // Prepare tape buffer only when playing
+    std::vector<int16_t> tapeBuf;
+    tapeBuf.resize(num_samples);
+    /*if (tapePlayer && tapePlaying) {
+        tapePlayer->generateSamples(static_cast<size_t>(num_samples), tapeBuf.data());
+    }
+    else {*/
+        for (int i = 0; i < num_samples; ++i) tapeBuf[i] = 0;
+    //}
+
     for (int i = 0; i < num_samples; ++i) {
-        audioBuffer.push_back(level);
+        int mixed = static_cast<int>(beeperLevel) + static_cast<int>(tapeBuf[i]);
+        if (mixed > INT16_MAX) mixed = INT16_MAX;
+        if (mixed < INT16_MIN) mixed = INT16_MIN;
+        audioBuffer.push_back(static_cast<int16_t>(mixed));
     }
 }
 
@@ -310,8 +401,24 @@ uint8_t MinZX::processInputPort(uint16_t port)
             if ((hi & (1 << row)) == 0)
                 result &= keymatrix[row];
 
-        // EAR (sin tape por ahora)
-        // result &= ~0x40;  // si quieres simular 0/1
+        // EAR - mapear desde tapePlayer si existe y está reproduciendo
+        //if (tapePlayer && tapePlaying) {
+            // tapePlayer->earLevelHigh() == true -> no pulse (line HIGH)
+            // cuando hay pulso queremos que el bit 6 sea 0 (activo)
+            //if (!tapePlayer->earLevelHigh())
+            //    result &= static_cast<uint8_t>(~0x40);
+        //}
+        //uint8_t ear_bit = tape.get_ear() ? 0x40 : 0x00;  // bit6 = 1 si HIGH
+        // EAR (bit 6)
+        //if (tape.motor)
+        //    result = (result & 0xBF) | (tape.get_ear() ? 0x40 : 0x00);  // 0xBF = ~0x40
+        //if(!tape.get_ear())
+        //    result &= (~0x40);
+
+
+        if (Tape_GetEAR()) result &= ~(1 << 6);
+        else               result |= (1 << 6);
+
 
         return result;
     }
@@ -336,11 +443,14 @@ void MinZX::processOutputPort(uint16_t port, uint8_t value)
 
     if (lo == 0xFE)
     {
-        flushAudioBuffer(tstates);
+        //flushAudioBuffer(tstates);
         speakerLevel = (value & 0x10) != 0;
         lastTstate = tstates;
 
         border = value & 0x07;
+
+        tape.motor = !!(value & 0x08);
+
     }
 }
 
@@ -359,7 +469,7 @@ bool MinZX::isActiveINT(void)
 
 void MinZX::interruptHandlingTime(int32_t wstates)
 {
-    tstates += wstates;
+    addTstates(wstates);
     intPending = false;
 }
 
@@ -378,24 +488,24 @@ unsigned char delay_contention(uint16_t address, unsigned int tstates)
 uint8_t MinZX::fetchOpcode(uint16_t address)
 {
     if ((address >> 14) == 1)
-        tstates += delay_contention(address, tstates);
-    tstates += 4;
+        addTstates(delay_contention(address, tstates));
+    addTstates(4);
     return mem[address];
 }
 
 uint8_t MinZX::peek8(uint16_t address)
 {
     if ((address >> 14) == 1)
-        tstates += delay_contention(address, tstates);
-    tstates += 3;
+        addTstates(delay_contention(address, tstates));
+    addTstates(3);
     return mem[address];
 }
 
 void MinZX::poke8(uint16_t address, uint8_t value)
 {
     if ((address >> 14) == 1)
-        tstates += delay_contention(address, tstates);
-    tstates += 3;
+        addTstates(delay_contention(address, tstates));
+    addTstates(3);
     mem[address] = value;
 }
 
@@ -414,13 +524,13 @@ void MinZX::poke16(uint16_t address, RegisterPair word)
 
 uint8_t MinZX::inPort(uint16_t port)
 {
-    tstates += 3;
+    addTstates(3);
     return processInputPort(port);
 }
 
 void MinZX::outPort(uint16_t port, uint8_t value)
 {
-    tstates += 4;
+    addTstates(4);
     processOutputPort(port, value);
 }
 
@@ -429,10 +539,10 @@ void MinZX::addressOnBus(uint16_t address, int32_t wstates)
     if ((address >> 14) == 1)
     {
         for (int i = 0; i < wstates; i++)
-            tstates += delay_contention(address, tstates) + 1;
+            addTstates(delay_contention(address, tstates) + 1);
     }
     else
-        tstates += wstates;
+        addTstates(wstates);
 }
 
 
@@ -459,4 +569,5 @@ void MinZX::destroy()
     delete z80;
     delete[] mem;
     delete[] ports;
+    //if (tapePlayer) { delete tapePlayer; tapePlayer = nullptr; }
 }
