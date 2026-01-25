@@ -2,6 +2,10 @@
 /*
  * ZX Spectrum 48K Emulator con SDL2 + JGZ80
  * - Carga .TAP por pulsos (pilot/sync/data) compatible ROM
+ * - Carga .TZX por pulsos:
+ *   - Soportados: 0x00(=0x10), 0x02(=0x12), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+ *                 0x18 (CSW raw sin compresión), 0x20, 0x24/0x25, 0x2A, 0x2B,
+ *                 0x30, 0x31, 0x32, 0x33, 0x35, 0x5A
  * - Carga .SNA (48K)
  * - BRIGHT aplicado a ink y paper
  * - Puerto FE: bit 6 = EAR (tape); bit 7 = espejo de bit 3 del último OUT
@@ -9,7 +13,7 @@
  *
  * Compilar LINUX:     gcc minzx.c jgz80/z80.c -o minzx -lSDL2 -lm
  * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
- * Uso: ./minzx [fichero.tap | snapshot.sna]
+ * Uso: ./minzx [cinta.tap | cinta.tzx | snapshot.sna]
  */
 
 #include <SDL2/SDL.h>
@@ -22,9 +26,6 @@
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #endif
-
-// Si no tienes este header, puedes quitarlo sin problema
-// #include "minzx.h"
 
 #include "jgz80/z80.h"
 
@@ -82,19 +83,14 @@ uint32_t zx_colors[16] = {
 #define BEEPER_EDGE_QUEUE_CAP 4096
 
 typedef struct {
-    // Audio/time
     double sample_rate;                 // p.ej., 44100
     double tstates_per_sec;             // 3500000.0
     double tstate_to_sample;            // sample_rate / tstates_per_sec
-
-    // Estado del generador
     uint64_t last_cycle_processed;      // T-state del último punto sintetizado
     bool     level;                     // nivel actual (false=-amp, true=+amp)
     int16_t  amp_pos;                   // amplitud positiva
     int16_t  amp_neg;                   // amplitud negativa
-
-    // Cola de flancos (T-states absolutos)
-    uint64_t edges[BEEPER_EDGE_QUEUE_CAP];
+    uint64_t edges[BEEPER_EDGE_QUEUE_CAP]; // cola de flancos (T-states absolutos)
     int head;                           // escribe main thread (port_out)
     int tail;                           // consume audio thread (callback)
 } beeper_t;
@@ -105,7 +101,7 @@ static void beeper_init(double sample_rate) {
     beeper.sample_rate       = sample_rate;
     beeper.tstates_per_sec   = 3500000.0;
     beeper.tstate_to_sample  = beeper.sample_rate / beeper.tstates_per_sec;
-    beeper.last_cycle_processed = global_cycles;  // referencia inicial
+    beeper.last_cycle_processed = global_cycles;
     beeper.level             = false;
     beeper.amp_pos           = 11000;
     beeper.amp_neg           = -11000;
@@ -123,52 +119,251 @@ static inline void beeper_push_edge_ts(uint64_t edge_cycle) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Cinta .TAP por pulsos compatible ROM
+// Utilidades lectura LE
 // ─────────────────────────────────────────────────────────────
-typedef enum { TAPE_IDLE, TAPE_PILOT, TAPE_SYNC1, TAPE_SYNC2, TAPE_DATA, TAPE_PAUSE } tape_phase_t;
+static inline uint8_t rd_u8(FILE* f) { int c = fgetc(f); return (c == EOF) ? 0 : (uint8_t)c; }
+static inline uint16_t rd_u16(FILE* f) { uint16_t lo = rd_u8(f), hi = rd_u8(f); return (uint16_t)(lo | (hi << 8)); }
+static inline uint32_t rd_u24(FILE* f) { uint32_t b0 = rd_u8(f), b1 = rd_u8(f), b2 = rd_u8(f); return (b0 | (b1 << 8) | (b2 << 16)); }
+static inline uint32_t rd_u32(FILE* f) { uint32_t b0 = rd_u8(f), b1 = rd_u8(f), b2 = rd_u8(f), b3 = rd_u8(f); return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)); }
+#define MS_TO_TSTATES(ms) ((uint64_t)((ms) * 3500ULL)) // 3.5MHz
+
+// ─────────────────────────────────────────────────────────────
+// Motor de cinta unificado (TAP/TZX)
+// ─────────────────────────────────────────────────────────────
+typedef enum { TAPE_FMT_NONE=0, TAPE_FMT_TAP=1, TAPE_FMT_TZX=2 } tape_fmt_t;
+typedef enum { PH_IDLE, PH_PILOT, PH_SYNC1, PH_SYNC2, PH_DATA, PH_PURE_TONE, PH_PULSE_SEQ, PH_DIRECT_REC, PH_PAUSE } pulse_phase_t;
 
 typedef struct {
-    FILE* f;
-    long  file_size;
-    long  file_pos;
+    FILE*   f;
+    long    file_size;
+    long    file_pos;
 
-    // Bloque actual (flag + payload + checksum)
-    uint8_t* blk;
-    uint16_t blk_len;
-    uint16_t blk_idx;     // no usado directamente (data_pos manda)
-    uint8_t  flag;        // 0x00 header / 0xFF data típicamente
+    // Formato
+    tape_fmt_t fmt;
 
-    // Emisión de pulsos
-    tape_phase_t phase;
-    int      pulses_left;            // pilot (medias ondas)
-    uint32_t halfwave_ts;            // duración media onda en T-states
-    uint64_t next_edge_cycle;        // ciclo (global_cycles) del próximo flanco
+    // Estado de reproducción
+    pulse_phase_t phase;
+    int      pulses_left;            // pilot/pure tone en medias ondas
+    uint32_t halfwave_ts;            // duración media onda (T-states)
+    uint64_t next_edge_cycle;        // T-state del próximo flanco
     bool     level;                  // EAR actual (true=1)
 
-    // Datos
-    uint16_t data_pos;               // índice dentro de blk[]
+    // Datos de bits
+    uint8_t* blk;
+    uint32_t blk_len;
+    uint32_t data_pos;
     uint8_t  cur_byte;
     int      cur_bit;                // 7..0
-    int      pulse_of_bit;           // 0/1 (dos medias ondas por bit)
+    int      pulse_of_bit;           // 0/1
 
-    // Config
-    double speed;                    // 1.0 real, >1.0 más rápido
+    // Parámetros activos (TZX/TAP parametrizadas)
+    uint16_t t_pilot, t_sync1, t_sync2, t_bit0, t_bit1;
+    uint16_t pilot_pulses;           // en ondas completas
+    uint16_t used_bits_last;         // 0 => 8
+    uint32_t pause_ms;
+
+    // Secuencias (0x13)
+    uint16_t* pulse_seq;
+    int       pulse_seq_n;
+    int       pulse_seq_i;
+
+    // Direct recording (0x15)
+    uint16_t dr_tstates_per_sample;
+    uint32_t dr_total_bits;
+    uint32_t dr_bit_index;
+
+    // CSW (0x18) — como secuencia de medias ondas ya convertidas
+    uint32_t csw_freq_hz;
+    uint8_t  csw_compression;        // 0=raw sin compresión (soportado)
+    uint32_t csw_data_len;
+
+    // Control
+    double speed;                    // solo TAP (escala)
     bool   playing;
+
+    // Nivel inicial (0x2B)
+    bool   initial_level_known;
+    bool   initial_level;
+
+    // Loop (0x24/0x25)
+    struct { long file_pos_at_loop; uint16_t remaining; int active; } loop;
+
 } tape_t;
 
 static tape_t tape = {0};
+static const char* tape_filename = NULL;
 
-// Timings (T-states) @3.5MHz
+// ─────────────────────────────────────────────────────────────
+// Timings TAP por defecto (T-states) @3.5MHz
+// ─────────────────────────────────────────────────────────────
 static const int TS_PILOT = 2168;
 static const int TS_SYNC1 = 667;
 static const int TS_SYNC2 = 735;
 static const int TS_BIT0  = 855;
 static const int TS_BIT1  = 1710;
 
-// Fichero recordado (para F6 recarga)
-static const char* tap_filename = NULL;
+static inline uint32_t halfwave_for_bit(bool bit1) { return bit1 ? tape.t_bit1 : tape.t_bit0; }
 
-// Lee siguiente bloque del .TAP a memoria
+// ─────────────────────────────────────────────────────────────
+// Listado de bloques TAP/TZX (para mostrar al cargar)
+// ─────────────────────────────────────────────────────────────
+static void list_tap_blocks(const char* filename) {
+    FILE* f = fopen(filename, "rb"); if (!f) { printf("No se pudo abrir TAP para listar: %s\n", filename); return; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    printf("=== LISTA TAP: %s (%ld bytes) ===\n", filename, fsz);
+    int idx=0;
+    while (1) {
+        uint8_t len_le[2];
+        if (fread(len_le,1,2,f)!=2) break;
+        uint16_t len = (uint16_t)(len_le[0] | (len_le[1]<<8));
+        if (len==0 || len > 65535) { printf("Bloque %d: longitud inválida %u\n", idx, len); break; }
+        uint8_t first=0xFF;
+        long pos=ftell(f);
+        if (len>=1) { fread(&first,1,1,f); fseek(f, pos, SEEK_SET); }
+        printf("Bloque %3d: len=%5u  flag=0x%02X (%s)\n", idx, len, first, (first==0x00?"HEADER/flag=0x00":(first==0xFF?"DATA/flag=0xFF":"?")));
+        fseek(f, len, SEEK_CUR);
+        idx++;
+    }
+    fclose(f);
+}
+
+static const char* tzx_name(uint8_t id) {
+    switch (id) {
+        case 0x00: return "Standard Speed Data (legacy alias)";
+        case 0x02: return "Pure Tone (legacy alias)";
+        case 0x10: return "Standard Speed Data";
+        case 0x11: return "Turbo Speed Data";
+        case 0x12: return "Pure Tone";
+        case 0x13: return "Pulse Sequence";
+        case 0x14: return "Pure Data";
+        case 0x15: return "Direct Recording";
+        case 0x18: return "CSW Recording";
+        case 0x19: return "Generalized Data";
+        case 0x20: return "Pause";
+        case 0x21: return "Group Start";
+        case 0x22: return "Group End";
+        case 0x24: return "Loop Start";
+        case 0x25: return "Loop End";
+        case 0x2A: return "Stop if 48K";
+        case 0x2B: return "Set Signal Level";
+        case 0x30: return "Text Description";
+        case 0x31: return "Message";
+        case 0x32: return "Archive Info";        // añadido
+        case 0x33: return "Hardware Type";
+        case 0x35: return "Custom Info";
+        case 0x5A: return "Glue";
+        default:   return "Desconocido/No soportado";
+    }
+}
+
+// Nombres amistosos para algunos campos de Archive Info (0x32)
+static const char* tzx_archive_field_name(uint8_t id) {
+    switch (id) {
+        case 0x00: return "Título";
+        case 0x01: return "Editorial/Publisher";
+        case 0x02: return "Autor";
+        case 0x03: return "Año";
+        case 0x04: return "Idioma";
+        case 0x05: return "Tipo/Género";
+        case 0x06: return "Precio";
+        case 0x07: return "Protección";
+        case 0x08: return "Origen";
+        case 0x09: return "Comentario";
+        default:   return "Campo";
+    }
+}
+
+static void list_tzx_blocks(const char* filename) {
+    FILE* f = fopen(filename, "rb"); if (!f) { printf("No se pudo abrir TZX para listar: %s\n", filename); return; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    char hdr[10]={0};
+    if (fread(hdr,1,10,f)<10 || memcmp(hdr,"ZXTape!\x1A",8)!=0) { printf("TZX inválido: %s\n", filename); fclose(f); return; }
+    printf("=== LISTA TZX: %s (%ld bytes) v%d.%02d ===\n", filename, fsz, (unsigned char)hdr[8], (unsigned char)hdr[9]);
+
+    int idx=0; long file_pos=10;
+    while (file_pos < fsz) {
+        int id = rd_u8(f); file_pos++;
+        printf("Bloque %3d: 0x%02X  %-22s", idx, id, tzx_name((uint8_t)id));
+        // Intento de salto según formato conocido (solo para listar; omite parse fino):
+        switch (id) {
+            case 0x00: // alias 0x10
+            case 0x10: { uint16_t pause=rd_u16(f); uint16_t dlen=rd_u16(f); file_pos+=4; fseek(f, dlen, SEEK_CUR); file_pos+=dlen; printf("  (pause=%ums, len=%u)\n", pause, dlen); } break;
+            case 0x02: // alias 0x12
+            case 0x12: { uint16_t tone=rd_u16(f); uint16_t pulses=rd_u16(f); file_pos+=4; printf("  (tone=%u, pulses=%u)\n", tone,pulses); } break;
+            case 0x11: { fseek(f, 2+2+2+2+2+2+1+2, SEEK_CUR); file_pos += 2+2+2+2+2+2+1+2; uint32_t dlen=rd_u24(f); file_pos+=3; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (turbo)\n"); } break;
+            case 0x13: { uint8_t n=rd_u8(f); file_pos++; fseek(f, n*2, SEEK_CUR); file_pos+=n*2; printf("  (seq=%u)\n", n); } break;
+            case 0x14: { fseek(f, 2+2+1+2, SEEK_CUR); file_pos += 2+2+1+2; uint32_t dlen=rd_u24(f); file_pos+=3; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (pure data len=%u)\n", dlen); } break;
+            case 0x15: { fseek(f, 2+2+1, SEEK_CUR); file_pos+=2+2+1; uint32_t dlen=rd_u24(f); file_pos+=3; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (direct rec len=%u)\n", dlen); } break;
+            case 0x18: { uint16_t pause=rd_u16(f); uint32_t freq=rd_u32(f); uint8_t comp=rd_u8(f); uint32_t dlen=rd_u32(f); file_pos+=2+4+1+4; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (CSW: pause=%ums, %uHz, comp=%u, data=%u)\n", pause, freq, comp, dlen); } break;
+            case 0x19: { uint32_t blen=rd_u32(f); file_pos+=4; fseek(f,blen,SEEK_CUR); file_pos+=blen; printf("  (GDB len=%u)\n", blen); } break;
+            case 0x20: { uint16_t ms=rd_u16(f); file_pos+=2; printf("  (pause=%u)\n", ms); } break;
+            case 0x21: { uint8_t l=rd_u8(f); file_pos++; fseek(f,l,SEEK_CUR); file_pos+=l; printf("  (group)\n"); } break;
+            case 0x22: { printf("\n"); } break;
+            case 0x24: { uint16_t c=rd_u16(f); file_pos+=2; printf("  (loop start x%u)\n", c); } break;
+            case 0x25: { printf("  (loop end)\n"); } break;
+            case 0x2A: { printf("  (stop if 48K)\n"); } break;
+            case 0x2B: { uint8_t lvl=rd_u8(f); file_pos++; printf("  (level=%u)\n", lvl); } break;
+            case 0x30: { uint8_t l=rd_u8(f); file_pos++; fseek(f,l,SEEK_CUR); file_pos+=l; printf("  (text)\n"); } break;
+            case 0x31: { uint8_t d=rd_u8(f); uint8_t l=rd_u8(f); file_pos+=2; fseek(f,l,SEEK_CUR); file_pos+=l; printf("  (message %us)\n", d); } break;
+
+            case 0x32: { // Archive Info: listar sus campos según la espec
+                uint16_t blen = rd_u16(f); file_pos += 2;
+				//printf("Vamos!!!!");
+#if 1
+                long end = file_pos + blen;
+                if (end > fsz) end = fsz; // defensa básica ante corrupción
+
+                if (file_pos >= end) { printf("  (archive info vacio)\n"); break; }
+
+                uint8_t n = rd_u8(f); file_pos += 1;
+                printf("  (archive info, %u campo%s)\n", n, (n==1?"":"s"));
+
+                for (uint8_t i=0; i<n && file_pos < end; ++i) {
+                    if (file_pos + 1 > end) break;
+                    uint8_t tid = rd_u8(f); file_pos += 1;
+
+                    if (file_pos + 2 > end) break;
+                    uint16_t slen = rd_u8(f); file_pos += 1;
+
+                    long remain = end - file_pos; if (remain < 0) remain = 0;
+                    uint16_t toread = (slen > (uint16_t)remain) ? (uint16_t)remain : slen;
+
+                    char* buf = (toread > 0) ? (char*)malloc((size_t)toread) : NULL;
+                    if (buf && toread > 0) { size_t rd = fread(buf, 1, toread, f); (void)rd; }
+                    if (toread < slen) fseek(f, slen - toread, SEEK_CUR);
+
+                    file_pos += slen;
+
+                    const char* fname = tzx_archive_field_name(tid);
+                    if (buf && toread > 0)
+                        printf("           - %s [0x%02X]: %.*s\n", fname, tid, (int)toread, buf);
+                    else
+                        printf("           - %s [0x%02X]: <vacío>\n", fname, tid);
+                    free(buf);
+                }
+
+                if (file_pos < end) { fseek(f, end - file_pos, SEEK_CUR); file_pos = end; }
+#endif
+				file_pos += blen;
+            } break;
+
+            case 0x33: { uint8_t n=rd_u8(f); file_pos++; fseek(f, n*3, SEEK_CUR); file_pos+=n*3; printf("  (hw %u)\n", n); } break;
+            case 0x35: { fseek(f, 16, SEEK_CUR); file_pos+=16; { uint32_t l=rd_u32(f); file_pos+=4; fseek(f,l,SEEK_CUR); file_pos+=l; } printf("  (custom)\n"); } break;
+            case 0x5A: { uint32_t l=rd_u32(f); file_pos+=4; fseek(f,l,SEEK_CUR); file_pos+=l; printf("  (glue)\n"); } break;
+            default: { printf("  (no sé saltarlo; paro listado)\n"); fclose(f); return; }
+        }
+        idx++;
+    }
+    fclose(f);
+}
+
+// ─────────────────────────────────────────────────────────────
+// TAP (integrado en motor unificado) + Trazas
+// ─────────────────────────────────────────────────────────────
+static bool tap_read_next_block();
+static void  start_block_emission(uint64_t now_cycle);
+static bool  tap_ear_level_until(uint64_t now_cycle);
+
 static bool tap_read_next_block() {
     if (!tape.f) return false;
     if (tape.file_pos >= tape.file_size) return false;
@@ -186,147 +381,574 @@ static bool tap_read_next_block() {
 
     if (fread(tape.blk, 1, len, tape.f) != len) return false;
     tape.file_pos += len;
-
     tape.blk_len = len;
-    tape.blk_idx = 0;
-    tape.flag    = tape.blk[0];
+
+    tape.t_pilot       = TS_PILOT;
+    tape.t_sync1       = TS_SYNC1;
+    tape.t_sync2       = TS_SYNC2;
+    tape.t_bit0        = TS_BIT0;
+    tape.t_bit1        = TS_BIT1;
+    tape.used_bits_last= 8;
+    tape.pilot_pulses  = (tape.blk[0] == 0x00) ? 8063 : 3223;
+    tape.pause_ms      = 1000;
+
+    printf("[TAP] Nuevo bloque: len=%u flag=0x%02X pilot=%u pause=%ums\n",
+           len, tape.blk[0], tape.pilot_pulses, tape.pause_ms);
     return true;
 }
 
-static void tap_start_block_emission(uint64_t now_cycle) {
-    tape.phase = TAPE_PILOT;
-    int pilot_pulses = (tape.flag == 0x00) ? 8063 : 3223; // ondas completas
-    tape.pulses_left = pilot_pulses * 2;                  // contamos medias ondas
-    tape.halfwave_ts = (uint32_t)(TS_PILOT / tape.speed);
+static void start_block_emission(uint64_t now_cycle) {
+    tape.phase       = PH_PILOT;
+    tape.pulses_left = tape.pilot_pulses * 2;
+    tape.halfwave_ts = tape.t_pilot;
+    if (tape.fmt == TAPE_FMT_TAP && tape.speed > 0.0)
+        tape.halfwave_ts = (uint32_t)(tape.halfwave_ts / tape.speed);
     tape.next_edge_cycle = now_cycle + tape.halfwave_ts;
-    tape.level = true;
-
+    tape.level = tape.initial_level_known ? tape.initial_level : true;
     tape.data_pos = 0;
-    tape.cur_bit = 7;
+    tape.cur_bit  = 7;
     tape.pulse_of_bit = 0;
 }
 
-static void tap_start_pause(uint64_t now_cycle) {
-    tape.phase = TAPE_PAUSE;
-    uint32_t pause_ts = (uint32_t)(3500000 / tape.speed); // ~1s
+static void start_pause(uint64_t now_cycle) {
+    tape.phase = PH_PAUSE;
+    uint32_t pause_ts = (tape.pause_ms == 0) ? MS_TO_TSTATES(0) : MS_TO_TSTATES(tape.pause_ms);
     tape.next_edge_cycle = now_cycle + pause_ts;
     tape.level = true;
 }
 
-static inline uint32_t tap_halwave_for_bit(bool bit1) {
-    return (uint32_t)((bit1 ? TS_BIT1 : TS_BIT0) / tape.speed);
-}
-
 static bool tap_ear_level_until(uint64_t now_cycle) {
-    if (!tape.playing || !tape.f || tape.phase == TAPE_IDLE) return true; // EAR alto
+    if (!tape.playing || !tape.f || tape.phase == PH_IDLE) return true;
     while (now_cycle >= tape.next_edge_cycle) {
-        // flanco → invertimos nivel
         tape.level = !tape.level;
         switch (tape.phase) {
-            case TAPE_PILOT:
+            case PH_PILOT:
                 if (--tape.pulses_left > 0) {
                     tape.next_edge_cycle += tape.halfwave_ts;
                 } else {
-                    tape.phase = TAPE_SYNC1;
-                    tape.halfwave_ts = (uint32_t)(TS_SYNC1 / tape.speed);
+                    tape.phase = PH_SYNC1;
+                    tape.halfwave_ts = (tape.fmt==TAPE_FMT_TAP && tape.speed>0.0) ? (uint32_t)(tape.t_sync1 / tape.speed) : tape.t_sync1;
                     tape.next_edge_cycle += tape.halfwave_ts;
                 }
                 break;
-            case TAPE_SYNC1:
-                tape.phase = TAPE_SYNC2;
-                tape.halfwave_ts = (uint32_t)(TS_SYNC2 / tape.speed);
+            case PH_SYNC1:
+                tape.phase = PH_SYNC2;
+                tape.halfwave_ts = (tape.fmt==TAPE_FMT_TAP && tape.speed>0.0) ? (uint32_t)(tape.t_sync2 / tape.speed) : tape.t_sync2;
                 tape.next_edge_cycle += tape.halfwave_ts;
                 break;
-            case TAPE_SYNC2:
-                tape.phase = TAPE_DATA;
-                tape.data_pos = 0;
-                tape.cur_bit = 7;
-                tape.pulse_of_bit = 0;
+            case PH_SYNC2:
+                tape.phase = PH_DATA;
+                tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
                 tape.cur_byte = tape.blk[tape.data_pos++];
                 {
                     bool b = (tape.cur_byte & 0x80) != 0;
-                    tape.halfwave_ts = tap_halwave_for_bit(b);
+                    tape.halfwave_ts = halfwave_for_bit(b);
+                    if (tape.fmt==TAPE_FMT_TAP && tape.speed>0.0) tape.halfwave_ts = (uint32_t)(tape.halfwave_ts / tape.speed);
                     tape.next_edge_cycle += tape.halfwave_ts;
                 }
                 break;
-            case TAPE_DATA: {
+            case PH_DATA: {
                 tape.pulse_of_bit ^= 1;
                 if (tape.pulse_of_bit == 1) {
-                    tape.next_edge_cycle += tape.halfwave_ts; // segunda media onda
+                    tape.next_edge_cycle += tape.halfwave_ts;
                 } else {
                     if (--tape.cur_bit < 0) {
                         if (tape.data_pos >= tape.blk_len) {
-                            tap_start_pause(now_cycle); // fin de bloque
+                            start_pause(now_cycle);
                             break;
                         }
                         tape.cur_bit = 7;
                         tape.cur_byte = tape.blk[tape.data_pos++];
                     }
                     bool b = ((tape.cur_byte >> tape.cur_bit) & 1) != 0;
-                    tape.halfwave_ts = tap_halwave_for_bit(b);
+                    tape.halfwave_ts = halfwave_for_bit(b);
+                    if (tape.fmt==TAPE_FMT_TAP && tape.speed>0.0) tape.halfwave_ts = (uint32_t)(tape.halfwave_ts / tape.speed);
                     tape.next_edge_cycle += tape.halfwave_ts;
                 }
             } break;
-            case TAPE_PAUSE:
+            case PH_PAUSE:
                 if (!tap_read_next_block()) {
-                    tape.phase = TAPE_IDLE;
-                    tape.playing = false;
-                    tape.level = true; // EAR alto
+                    tape.phase = PH_IDLE; tape.playing = false; tape.level = true;
                 } else {
-                    tap_start_block_emission(now_cycle);
+                    start_block_emission(now_cycle);
                 }
                 break;
             default: break;
         }
-        if (tape.phase == TAPE_IDLE) break;
+        if (tape.phase == PH_IDLE) break;
     }
     return tape.level;
 }
 
 bool load_tap(const char* filename) {
+    list_tap_blocks(filename); // listado completo al cargar
+
     if (tape.f) { fclose(tape.f); tape.f = NULL; }
     tape.f = fopen(filename, "rb");
-    if (!tape.f) {
-        printf("No se pudo abrir %s\n", filename);
-        tape.playing = false;
-        return false;
-    }
+    if (!tape.f) { printf("No se pudo abrir %s\n", filename); tape.playing = false; return false; }
 
-    fseek(tape.f, 0, SEEK_END);
-    tape.file_size = ftell(tape.f);
-    fseek(tape.f, 0, SEEK_SET);
-    tape.file_pos = 0;
+    fseek(tape.f, 0, SEEK_END); tape.file_size = ftell(tape.f);
+    fseek(tape.f, 0, SEEK_SET); tape.file_pos = 0;
 
     free(tape.blk); tape.blk = NULL;
-    tape.blk_len = tape.blk_idx = 0;
-
-    tape.speed   = 1.0;   // 2x (ajusta: 1.0..8.0)
+    free(tape.pulse_seq); tape.pulse_seq = NULL;
+    tape.blk_len = 0;
+    tape.fmt = TAPE_FMT_TAP;
+    tape.speed   = 1.0;
     tape.playing = true;
+    tape.initial_level_known = false;
 
-    if (!tap_read_next_block()) {
-        printf("TAP vacío.\n");
-        tape.playing = false;
-        return false;
-    }
-    tap_start_block_emission(global_cycles);
+    if (!tap_read_next_block()) { printf("TAP vacío.\n"); tape.playing = false; return false; }
+    start_block_emission(global_cycles);
     border_color = 7;
 
     printf("TAP cargado: %s (%ld bytes)\n", filename, tape.file_size);
-    tap_filename = filename; // recordar para F6 recarga
+    tape_filename = filename;
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────
+// TZX  (incluye alias 0x00→0x10, 0x02→0x12 y CSW 0x18 básico + Trazas)
+// ─────────────────────────────────────────────────────────────
+static bool tzx_read_and_prepare_next_block(uint64_t now);
+
+static void tzx_prepare_standard_or_turbo(uint64_t now) {
+    tape.phase       = PH_PILOT;
+    tape.pulses_left = tape.pilot_pulses * 2;
+    tape.halfwave_ts = tape.t_pilot;
+    tape.next_edge_cycle = now + tape.halfwave_ts;
+    tape.level = tape.initial_level_known ? tape.initial_level : true;
+
+    tape.data_pos = 0;
+    tape.cur_bit  = 7;
+    tape.pulse_of_bit = 0;
+    tape.cur_byte = (tape.blk_len>0) ? tape.blk[tape.data_pos++] : 0x00;
+}
+
+static bool tzx_ear_level_until(uint64_t now_cycle) {
+    if (!tape.playing || !tape.f || tape.phase == PH_IDLE) return true;
+
+    while (now_cycle >= tape.next_edge_cycle) {
+        tape.level = !tape.level;
+
+        switch (tape.phase) {
+            case PH_PILOT:
+            case PH_PURE_TONE:
+                if (--tape.pulses_left > 0) {
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                } else {
+                    if (tape.t_sync1) {
+                        tape.phase = PH_SYNC1;
+                        tape.halfwave_ts = tape.t_sync1;
+                        tape.next_edge_cycle += tape.halfwave_ts;
+                    } else {
+                        if (tape.t_bit0 || tape.t_bit1) {
+                            tape.phase = PH_DATA;
+                            tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
+                            tape.cur_byte = (tape.blk_len > 0) ? tape.blk[tape.data_pos++] : 0x00;
+                            bool b = (tape.cur_byte & 0x80) != 0;
+                            tape.halfwave_ts = halfwave_for_bit(b);
+                            tape.next_edge_cycle += tape.halfwave_ts;
+                        } else {
+                            tape.phase = PH_PAUSE;
+                            tape.next_edge_cycle += MS_TO_TSTATES(tape.pause_ms);
+                        }
+                    }
+                }
+                break;
+
+            case PH_SYNC1:
+                tape.phase = tape.t_sync2 ? PH_SYNC2 : PH_DATA;
+                if (tape.phase == PH_SYNC2) {
+                    tape.halfwave_ts = tape.t_sync2;
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                } else {
+                    tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
+                    tape.cur_byte = (tape.blk_len > 0) ? tape.blk[tape.data_pos++] : 0x00;
+                    bool b = (tape.cur_byte & 0x80) != 0;
+                    tape.halfwave_ts = halfwave_for_bit(b);
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                }
+                break;
+
+            case PH_SYNC2:
+                tape.phase = PH_DATA;
+                tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
+                tape.cur_byte = (tape.blk_len > 0) ? tape.blk[tape.data_pos++] : 0x00;
+                {
+                    bool b = (tape.cur_byte & 0x80) != 0;
+                    tape.halfwave_ts = halfwave_for_bit(b);
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                }
+                break;
+
+            case PH_DATA: {
+                tape.pulse_of_bit ^= 1;
+                if (tape.pulse_of_bit == 1) {
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                } else {
+                    if (--tape.cur_bit < 0) {
+                        if (tape.data_pos >= tape.blk_len) {
+                            tape.phase = PH_PAUSE;
+                            tape.next_edge_cycle += MS_TO_TSTATES(tape.pause_ms);
+                            break;
+                        }
+                        tape.cur_bit = 7;
+                        tape.cur_byte = tape.blk[tape.data_pos++];
+                    }
+
+                    if (tape.data_pos == tape.blk_len && tape.used_bits_last && tape.used_bits_last != 8) {
+                        int emitted_bits = 7 - tape.cur_bit;
+                        if (emitted_bits >= tape.used_bits_last) {
+                            tape.phase = PH_PAUSE;
+                            tape.next_edge_cycle += MS_TO_TSTATES(tape.pause_ms);
+                            break;
+                        }
+                    }
+
+                    bool b = ((tape.cur_byte >> tape.cur_bit) & 1) != 0;
+                    tape.halfwave_ts = halfwave_for_bit(b);
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                }
+            } break;
+
+            case PH_PULSE_SEQ:
+                if (tape.pulse_seq_i < tape.pulse_seq_n) {
+                    tape.halfwave_ts = tape.pulse_seq[tape.pulse_seq_i++];
+                    tape.next_edge_cycle += tape.halfwave_ts;
+                } else {
+                    tape.phase = PH_PAUSE;
+                    tape.next_edge_cycle += MS_TO_TSTATES(tape.pause_ms);
+                }
+                break;
+
+            case PH_DIRECT_REC: {
+                if (tape.dr_bit_index >= tape.dr_total_bits) {
+                    tape.phase = PH_PAUSE;
+                    tape.next_edge_cycle += MS_TO_TSTATES(tape.pause_ms);
+                    break;
+                }
+                uint32_t byte_i = tape.dr_bit_index >> 3;
+                int      bit_i  = 7 - (tape.dr_bit_index & 7);
+                uint8_t  b      = tape.blk[byte_i];
+                bool     lvl    = ((b >> bit_i) & 1) != 0;
+                tape.next_edge_cycle += tape.dr_tstates_per_sample;
+                if (lvl != tape.level) { /* mantener el toggle ya aplicado */ }
+                else { tape.level = !tape.level; } // revertir toggle artificial
+                tape.dr_bit_index++;
+            } break;
+
+            case PH_PAUSE:
+                if (!tzx_read_and_prepare_next_block(now_cycle)) {
+                    tape.phase = PH_IDLE; tape.playing = false; tape.level = true;
+                }
+                break;
+
+            case PH_IDLE:
+            default:
+                return tape.level;
+        }
+        if (tape.phase == PH_IDLE) break;
+    }
+    return tape.level;
+}
+
+static bool tzx_read_and_prepare_next_block(uint64_t now) {
+    if (tape.file_pos >= tape.file_size) return false;
+    int id = rd_u8(tape.f); tape.file_pos++;
+
+    switch (id) {
+        // ── Aliases legacy: 0x00→0x10, 0x02→0x12
+        case 0x00: // Standard Speed Data (legacy)
+            printf("[TZX] Bloque 0x00 (alias 0x10 Standard Speed)\n");
+            // fall-through a 0x10
+        case 0x10: { // Standard Speed Data
+            tape.pause_ms = rd_u16(tape.f);  tape.file_pos += 2;
+            uint16_t dlen = rd_u16(tape.f);  tape.file_pos += 2;
+            free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
+            if (!tape.blk) return false;
+            fread(tape.blk, 1, dlen, tape.f); tape.file_pos += dlen;
+            tape.blk_len = dlen;
+            tape.t_pilot = 2168; tape.t_sync1 = 667; tape.t_sync2 = 735;
+            tape.t_bit0  = 855;  tape.t_bit1  = 1710;
+            tape.used_bits_last = 8;
+            tape.pilot_pulses = (tape.blk_len>0 && tape.blk[0]==0x00) ? 8063 : 3223;
+
+            printf("[TZX] 0x10 std: pause=%ums len=%u pilot=%u\n", tape.pause_ms, dlen, tape.pilot_pulses);
+            tzx_prepare_standard_or_turbo(now);
+        } return true;
+
+        case 0x02: // Pure Tone (legacy)
+            printf("[TZX] Bloque 0x02 (alias 0x12 Pure Tone)\n");
+            // fall-through a 0x12
+        case 0x12: { // Pure Tone
+            uint16_t tone_len = rd_u16(tape.f); tape.file_pos += 2;
+            uint16_t tone_pulses = rd_u16(tape.f); tape.file_pos += 2;
+            tape.t_pilot = tape.t_sync1 = tape.t_sync2 = 0;
+            tape.t_bit0 = tape.t_bit1 = 0;
+            tape.pulse_seq_n = 0;
+            tape.pause_ms = 0;
+            tape.halfwave_ts = tone_len;
+            tape.pulses_left = tone_pulses * 2;
+            tape.phase = PH_PURE_TONE;
+            tape.next_edge_cycle = now + tape.halfwave_ts;
+            tape.level = tape.initial_level_known ? tape.initial_level : true;
+            printf("[TZX] 0x12 tone: halfwave=%u pulses=%u\n", tone_len, tone_pulses);
+        } return true;
+
+        case 0x11: { // Turbo
+            tape.t_pilot = rd_u16(tape.f);   tape.file_pos += 2;
+            tape.pilot_pulses = rd_u16(tape.f); tape.file_pos += 2;
+            tape.t_sync1 = rd_u16(tape.f);   tape.file_pos += 2;
+            tape.t_sync2 = rd_u16(tape.f);   tape.file_pos += 2;
+            tape.t_bit0  = rd_u16(tape.f);   tape.file_pos += 2;
+            tape.t_bit1  = rd_u16(tape.f);   tape.file_pos += 2;
+            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1;
+            tape.pause_ms = rd_u16(tape.f);  tape.file_pos += 2;
+            uint32_t dlen = rd_u24(tape.f);  tape.file_pos += 3;
+            free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
+            if (!tape.blk) return false;
+            fread(tape.blk, 1, dlen, tape.f); tape.file_pos += dlen;
+            tape.blk_len = dlen;
+            printf("[TZX] 0x11 turbo: len=%u pilot=%u bit0=%u bit1=%u usedLast=%u pause=%u\n",
+                   dlen, tape.pilot_pulses, tape.t_bit0, tape.t_bit1, tape.used_bits_last, tape.pause_ms);
+            tzx_prepare_standard_or_turbo(now);
+        } return true;
+
+        case 0x13: { // Pulse sequence
+            int n = rd_u8(tape.f); tape.file_pos += 1;
+            free(tape.pulse_seq); tape.pulse_seq = (uint16_t*)malloc(sizeof(uint16_t)*n);
+            if (!tape.pulse_seq) return false;
+            for (int i=0;i<n;i++){ tape.pulse_seq[i]=rd_u16(tape.f); } tape.file_pos += 2*n;
+            tape.pulse_seq_n = n; tape.pulse_seq_i = 0;
+            tape.pause_ms = 0;
+            tape.phase = PH_PULSE_SEQ;
+            tape.halfwave_ts = (n>0)? tape.pulse_seq[0] : 0;
+            tape.next_edge_cycle = now + (tape.halfwave_ts? tape.halfwave_ts : 1);
+            tape.level = tape.initial_level_known ? tape.initial_level : true;
+            printf("[TZX] 0x13 pulse-seq: n=%d\n", n);
+        } return true;
+
+        case 0x14: { // Pure Data
+            tape.t_bit0  = rd_u16(tape.f);    tape.file_pos += 2;
+            tape.t_bit1  = rd_u16(tape.f);    tape.file_pos += 2;
+            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1;
+            tape.pause_ms = rd_u16(tape.f);   tape.file_pos += 2;
+            uint32_t dlen = rd_u24(tape.f);   tape.file_pos += 3;
+            free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
+            if (!tape.blk) return false;
+            fread(tape.blk, 1, dlen, tape.f); tape.file_pos += dlen;
+            tape.blk_len = dlen;
+            tape.t_pilot = tape.t_sync1 = tape.t_sync2 = 0;
+            tape.phase = PH_DATA;
+            tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
+            tape.cur_byte = (tape.blk_len>0)? tape.blk[tape.data_pos++] : 0x00;
+            bool b = (tape.cur_byte & 0x80) != 0;
+            tape.halfwave_ts = halfwave_for_bit(b);
+            tape.level = tape.initial_level_known ? tape.initial_level : true;
+            tape.next_edge_cycle = now + tape.halfwave_ts;
+            printf("[TZX] 0x14 pure-data: len=%u bit0=%u bit1=%u usedLast=%u pause=%u\n",
+                   dlen, tape.t_bit0, tape.t_bit1, tape.used_bits_last, tape.pause_ms);
+        } return true;
+
+        case 0x15: { // Direct Recording
+            tape.dr_tstates_per_sample = rd_u16(tape.f); tape.file_pos += 2;
+            tape.pause_ms = rd_u16(tape.f);  tape.file_pos += 2;
+            uint8_t used_last = rd_u8(tape.f); tape.file_pos += 1;
+            uint32_t dlen = rd_u24(tape.f);  tape.file_pos += 3;
+            free(tape.blk); tape.blk=(uint8_t*)malloc(dlen);
+            if (!tape.blk) return false;
+            fread(tape.blk, 1, dlen, tape.f); tape.file_pos += dlen;
+            tape.blk_len = dlen;
+            tape.dr_total_bits = (dlen-1)*8 + ((used_last==0)? 8 : used_last);
+            tape.dr_bit_index = 0;
+            tape.phase = PH_DIRECT_REC;
+            tape.level = tape.initial_level_known ? tape.initial_level : true;
+            tape.next_edge_cycle = now + tape.dr_tstates_per_sample;
+            printf("[TZX] 0x15 direct-rec: bitTs=%u pause=%u len=%u usedLast=%u\n",
+                   tape.dr_tstates_per_sample, tape.pause_ms, dlen, used_last);
+        } return true;
+
+        case 0x18: { // CSW Recording (soporte base: compresión=0 raw)
+            uint16_t pause_ms = rd_u16(tape.f); tape.file_pos += 2;
+            uint32_t freq_hz  = rd_u32(tape.f); tape.file_pos += 4;
+            uint8_t  comp     = rd_u8(tape.f);  tape.file_pos += 1;  // 0=raw sin compresión (asumido)
+            uint32_t data_len = rd_u32(tape.f); tape.file_pos += 4;
+
+            free(tape.blk); tape.blk = (uint8_t*)malloc(data_len);
+            if (!tape.blk) return false;
+            fread(tape.blk,1,data_len,tape.f); tape.file_pos += data_len;
+
+            tape.pause_ms = pause_ms;
+            tape.csw_freq_hz = freq_hz;
+            tape.csw_compression = comp;
+            tape.csw_data_len = data_len;
+
+            // Convertimos CSW raw a secuencia de medias ondas si compresión=0:
+            if (comp == 0 && data_len >= 2) {
+                uint32_t pairs = data_len / 2;
+                free(tape.pulse_seq); tape.pulse_seq = (uint16_t*)malloc(sizeof(uint16_t)*pairs);
+                if (!tape.pulse_seq) return false;
+
+                int n=0;
+                for (uint32_t i=0;i<pairs;i++) {
+                    uint16_t samples = (uint16_t)(tape.blk[2*i] | (tape.blk[2*i+1]<<8));
+                    if (samples==0) continue; // ignora silencios nulos
+                    uint32_t ts = (uint32_t)(((uint64_t)samples * 3500000ULL) / (freq_hz ? freq_hz : 1));
+                    if (ts==0) ts=1;
+                    while (ts > 0) {
+                        uint16_t chunk = (ts > 65535) ? 65535 : (uint16_t)ts;
+                        tape.pulse_seq[n++] = chunk;
+                        ts -= chunk;
+                    }
+                }
+                tape.pulse_seq_n = n;
+                tape.pulse_seq_i = 0;
+                tape.phase = PH_PULSE_SEQ;
+                tape.halfwave_ts = (n>0)? tape.pulse_seq[0] : 1;
+                tape.level = tape.initial_level_known ? tape.initial_level : true;
+                tape.next_edge_cycle = now + tape.halfwave_ts;
+
+                printf("[TZX] 0x18 CSW(raw): pause=%ums freq=%uHz pulses=%d (from %u bytes)\n",
+                       pause_ms, freq_hz, n, data_len);
+            } else {
+                printf("[TZX] 0x18 CSW comp=%u NO soportado; se salta (pause=%ums, data=%u)\n",
+                       comp, pause_ms, data_len);
+                tape.phase = PH_PAUSE;
+                tape.next_edge_cycle = now + MS_TO_TSTATES(pause_ms);
+                tape.level = true;
+            }
+        } return true;
+
+        case 0x20: { // Pause
+            uint16_t ms = rd_u16(tape.f); tape.file_pos += 2;
+            if (ms == 0) { tape.phase = PH_IDLE; tape.playing = false; tape.level = true; printf("[TZX] 0x20 pause=0 (stop)\n"); return false; }
+            tape.pause_ms = ms;
+            tape.phase = PH_PAUSE; tape.next_edge_cycle = now + MS_TO_TSTATES(ms); tape.level = true;
+            printf("[TZX] 0x20 pause=%u\n", ms);
+        } return true;
+
+        case 0x21: { uint8_t ln = rd_u8(tape.f); tape.file_pos += 1; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x21 group-start\n"); return tzx_read_and_prepare_next_block(now); }
+        case 0x22: { printf("[TZX] 0x22 group-end\n"); return tzx_read_and_prepare_next_block(now); }
+
+        case 0x24: { uint16_t count = rd_u16(tape.f); tape.file_pos += 2; tape.loop.file_pos_at_loop = ftell(tape.f); tape.loop.remaining = count; tape.loop.active = 1; printf("[TZX] 0x24 loop-start x%u\n", count); return tzx_read_and_prepare_next_block(now); }
+        case 0x25: { printf("[TZX] 0x25 loop-end (remain=%u)\n", tape.loop.remaining); if (tape.loop.active && tape.loop.remaining > 1) { tape.loop.remaining--; fseek(tape.f, tape.loop.file_pos_at_loop, SEEK_SET); tape.file_pos = tape.loop.file_pos_at_loop; return tzx_read_and_prepare_next_block(now); } else { tape.loop.active = 0; return tzx_read_and_prepare_next_block(now);} }
+
+        case 0x2A: { tape.phase = PH_IDLE; tape.playing = false; tape.level = true; printf("[TZX] 0x2A stop-if-48K → STOP\n"); return false; }
+        case 0x2B: { uint8_t lvl = rd_u8(tape.f); tape.file_pos += 1; tape.initial_level_known = true; tape.initial_level = (lvl != 0); printf("[TZX] 0x2B set-level=%u\n"); return tzx_read_and_prepare_next_block(now); }
+
+        case 0x30: { uint8_t ln = rd_u8(tape.f); tape.file_pos += 1; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x30 text\n"); return tzx_read_and_prepare_next_block(now); }
+        case 0x31: { uint8_t dur = rd_u8(tape.f); uint8_t ln = rd_u8(tape.f); tape.file_pos += 2; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x31 message %us\n", dur); return tzx_read_and_prepare_next_block(now); }
+
+        case 0x32: { // Archive Info (metadatos; se muestra y se continúa)
+            uint16_t blen = rd_u16(tape.f); tape.file_pos += 2;
+			printf("Longitud bloque completo: %d\n", blen);
+            long end = tape.file_pos + blen;
+			printf("Posicion final: %d\n", end);
+            if (end > tape.file_size) end = tape.file_size;
+
+            printf("[TZX] 0x32 archive-info:\n");
+#if 1
+            if (tape.file_pos >= end) { printf("       (vacío)\n"); return tzx_read_and_prepare_next_block(now); }
+
+            uint8_t n = rd_u8(tape.f); tape.file_pos += 1;
+            printf("       %u campo%s\n", n, (n==1?"":"s"));
+
+            for (uint8_t i = 0; (i < n) && (tape.file_pos < end); ++i) {
+                if (tape.file_pos + 1 > end) break;
+                uint8_t tid = rd_u8(tape.f); tape.file_pos += 1;
+
+                if (tape.file_pos + 2 > end) break;
+                uint8_t slen = rd_u8(tape.f); tape.file_pos += 1;
+
+                long remain = end - tape.file_pos; if (remain < 0) remain = 0;
+                uint16_t toread = (slen > (uint16_t)remain) ? (uint16_t)remain : slen;
+
+                char* buf = (toread > 0) ? (char*)malloc((size_t)toread) : NULL;
+                if (buf && toread > 0) { size_t rd = fread(buf, 1, toread, tape.f); (void)rd; }
+                if (toread < slen) fseek(tape.f, slen - toread, SEEK_CUR);
+
+                tape.file_pos += slen;
+
+                const char* fname = tzx_archive_field_name(tid);
+                if (buf && toread > 0)
+                    printf("       - %s [0x%02X]: %.*s\n", fname, tid, (int)toread, buf);
+                else
+                    printf("       - %s [0x%02X]: <vacío>\n", fname, tid);
+
+                free(buf);
+            }
+
+            if (tape.file_pos < end) { fseek(tape.f, end - tape.file_pos, SEEK_CUR); tape.file_pos = end; }
+#endif
+			tape.file_pos += blen;
+            return tzx_read_and_prepare_next_block(now);
+        }
+
+        case 0x33: { uint8_t n = rd_u8(tape.f); tape.file_pos += 1; fseek(tape.f, n*3, SEEK_CUR); tape.file_pos += n*3; printf("[TZX] 0x33 hardware x%u\n", n); return tzx_read_and_prepare_next_block(now); }
+        case 0x35: { fseek(tape.f, 16, SEEK_CUR); tape.file_pos += 16; { uint32_t ln = rd_u32(tape.f); tape.file_pos += 4; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; } printf("[TZX] 0x35 custom\n"); return tzx_read_and_prepare_next_block(now); }
+        case 0x5A: { uint32_t ln = rd_u32(tape.f); tape.file_pos += 4; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x5A glue\n"); return tzx_read_and_prepare_next_block(now); }
+
+        // 0x19 GDB (no implementado): saltamos si viene con longitud explícita (en spec avanzada)
+        case 0x19: {
+            uint32_t blen = rd_u32(tape.f); tape.file_pos += 4;
+            fseek(tape.f, blen, SEEK_CUR); tape.file_pos += blen;
+            printf("[TZX] 0x19 GDB (saltado len=%u)\n", blen);
+            return tzx_read_and_prepare_next_block(now);
+        }
+
+        default:
+            fprintf(stderr, "[TZX] Bloque 0x%02X no soportado.\n", id);
+            return false;
+    }
+}
+
+bool load_tzx(const char* filename) {
+    list_tzx_blocks(filename); // listado completo al cargar
+
+    if (tape.f) { fclose(tape.f); tape.f = NULL; }
+    tape.f = fopen(filename, "rb");
+    if (!tape.f) { fprintf(stderr, "No se pudo abrir %s\n", filename); return false; }
+
+    fseek(tape.f, 0, SEEK_END); tape.file_size = ftell(tape.f);
+    fseek(tape.f, 0, SEEK_SET); tape.file_pos = 0;
+
+    char hdr[10]={0};
+    if (fread(hdr,1,10,tape.f) < 10 || memcmp(hdr,"ZXTape!\x1A",8) != 0) {
+        fprintf(stderr, "TZX: cabecera inválida.\n");
+        fclose(tape.f); tape.f = NULL; return false;
+    }
+    tape.file_pos += 10;
+
+    free(tape.blk); tape.blk=NULL;
+    free(tape.pulse_seq); tape.pulse_seq=NULL;
+    tape.blk_len = 0;
+    tape.fmt = TAPE_FMT_TZX;
+    tape.playing = false;
+    tape.initial_level_known = false;
+    tape.loop.active = 0;
+
+    if (!tzx_read_and_prepare_next_block(global_cycles)) { tape.playing=false; return false; }
+    border_color = 7;
+
+    printf("TZX cargado: %s (%ld bytes) v%d.%02d\n", filename, tape.file_size, (unsigned char)hdr[8], (unsigned char)hdr[9]);
+    tape_filename = filename;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Selector unificado EAR
+// ─────────────────────────────────────────────────────────────
 static inline bool get_current_ear_level_from_tape(void) {
-    return tap_ear_level_until(global_cycles);
+    if (tape.fmt == TAPE_FMT_TZX) return tzx_ear_level_until(global_cycles);
+    if (tape.fmt == TAPE_FMT_TAP) return tap_ear_level_until(global_cycles);
+    return true; // sin cinta → EAR alto
 }
 
 // ─────────────────────────────────────────────────────────────
 // Contended RAM (placeholder; desactivado)
 // ─────────────────────────────────────────────────────────────
-int contended_delay(uint16_t addr, int tstates_in_line) {
-    (void)addr; (void)tstates_in_line;
-    return 0;
-}
+int contended_delay(uint16_t addr, int tstates_in_line) { (void)addr; (void)tstates_in_line; return 0; }
 
 // ─────────────────────────────────────────────────────────────
 // Memoria y puertos
@@ -366,7 +988,7 @@ uint8_t port_in(z80* z, uint16_t port) {
     if ((port & 1) == 0) { // FE
         uint8_t hi = port >> 8;
 
-        // Teclado (fila activa cuando bit de 'hi' = 0)
+        // Teclado
         for (int r = 0; r < 8; r++)
             if ((hi & (1 << r)) == 0)
                 res &= keyboard[r];
@@ -377,7 +999,7 @@ uint8_t port_in(z80* z, uint16_t port) {
         // Bit 7 = espejo del bit 3 del último OUT a FE
         if (last_fe_write & 0x08) res &= ~0x80; else res |= 0x80;
 
-        // Bit 6 = EAR desde la cinta por pulsos
+        // Bit 6 = EAR desde cinta
         bool ear = get_current_ear_level_from_tape();
         if (ear) res |= 0x40; else res &= ~0x40;
     }
@@ -395,8 +1017,6 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         bool new_state = (val & 0x10) != 0;
         if (new_state != speaker_state) {
             speaker_state = new_state;
-
-            // Registrar flanco en beeper con timestamp (T-states)
             if (audio_dev) SDL_LockAudioDevice(audio_dev);
             beeper_push_edge_ts(global_cycles);
             if (audio_dev) SDL_UnlockAudioDevice(audio_dev);
@@ -429,9 +1049,9 @@ void displayscanline(int y, int flash_phase) {
         int vy = y - v_border_top;
 
         int addr_pix = 0x4000
-            + ((vy & 0xC0) << 5)   // filas 0..2
-            + ((vy & 0x07) << 8)   // línea dentro del bloque de 8
-            + ((vy & 0x38) << 2);  // bloque de 8 líneas
+            + ((vy & 0xC0) << 5)
+            + ((vy & 0x07) << 8)
+            + ((vy & 0x38) << 2);
 
         int addr_att = 0x5800 + (32 * (vy >> 3));
 
@@ -443,7 +1063,7 @@ void displayscanline(int y, int flash_phase) {
             int ink    = (att & 0x07) + bright;
             int paper  = ((att >> 3) & 0x07) + bright;
 
-            if (att & 0x80) { // FLASH
+            if (att & 0x80) {
                 if (flash_phase) { int t = ink; ink = paper; paper = t; }
             }
 
@@ -484,44 +1104,30 @@ void audio_callback(void* userdata, uint8_t* stream, int len) {
 
     int produced = 0;
     while (produced < samples_to_write) {
-        // Próximo flanco (si existe)
-        uint64_t next_edge = (beeper.tail != beeper.head)
-                           ? beeper.edges[beeper.tail]
-                           : UINT64_MAX;
+        uint64_t next_edge = (beeper.tail != beeper.head) ? beeper.edges[beeper.tail] : UINT64_MAX;
 
-        // ¿Cuántas muestras hasta el flanco?
         double samples_until_edge_d;
         if (next_edge == UINT64_MAX) {
             samples_until_edge_d = (double)(samples_to_write - produced);
         } else {
-            uint64_t delta_tstates = (next_edge > beeper.last_cycle_processed)
-                ? (next_edge - beeper.last_cycle_processed)
-                : 0;
+            uint64_t delta_tstates = (next_edge > beeper.last_cycle_processed) ? (next_edge - beeper.last_cycle_processed) : 0;
             samples_until_edge_d = delta_tstates * beeper.tstate_to_sample;
             if (samples_until_edge_d < 0.0) samples_until_edge_d = 0.0;
         }
 
         int chunk = (int)samples_until_edge_d;
         if (chunk <= 0) {
-            // Estamos en/justo sobre el flanco → cambiamos nivel y consumimos el evento
             beeper.level = !beeper.level;
             beeper.last_cycle_processed = next_edge;
-            if (beeper.tail != beeper.head) {
-                beeper.tail = (beeper.tail + 1) % BEEPER_EDGE_QUEUE_CAP;
-            }
+            if (beeper.tail != beeper.head) beeper.tail = (beeper.tail + 1) % BEEPER_EDGE_QUEUE_CAP;
             continue;
         }
 
-        if (chunk > (samples_to_write - produced))
-            chunk = samples_to_write - produced;
+        if (chunk > (samples_to_write - produced)) chunk = samples_to_write - produced;
 
-        // Escribir 'chunk' muestras al nivel actual
         int16_t val = beeper.level ? beeper.amp_pos : beeper.amp_neg;
-        for (int i = 0; i < chunk; ++i) {
-            out[produced++] = val;
-        }
+        for (int i = 0; i < chunk; ++i) out[produced++] = val;
 
-        // Avanza el “tiempo” sintetizado (en T-states equivalentes)
         double tstates_advanced_d = (double)chunk / beeper.tstate_to_sample;
         uint64_t tstates_advanced = (uint64_t)(tstates_advanced_d + 0.5);
         beeper.last_cycle_processed += tstates_advanced;
@@ -541,8 +1147,21 @@ void handle_input() {
             z80_reset(&cpu);
 
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F6) {
-            if (tap_filename) load_tap(tap_filename);
+            if (tape_filename) {
+                const char* ext = strrchr(tape_filename, '.');
+                if (ext && strcasecmp(ext, ".tap") == 0) load_tap(tape_filename);
+                else if (ext && strcasecmp(ext, ".tzx") == 0) load_tzx(tape_filename);
+            }
         }
+
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F7) {
+            if (tape_filename) {
+                tape.playing=!tape.playing;
+            }
+        }
+
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12)
+            z80_reset(&cpu);
 
         if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
             bool press = (e.type == SDL_KEYDOWN);
@@ -594,10 +1213,8 @@ void handle_input() {
             }
 
             if (row >= 0 && bit >= 0) {
-                if (press)
-                    keyboard[row] &= ~(1 << bit);
-                else
-                    keyboard[row] |= (1 << bit);
+                if (press) keyboard[row] &= ~(1 << bit);
+                else       keyboard[row] |=  (1 << bit);
             }
         }
     }
@@ -608,17 +1225,10 @@ void handle_input() {
 // ─────────────────────────────────────────────────────────────
 bool load_sna(const char* filename) {
     FILE* f = fopen(filename, "rb");
-    if (!f) {
-        fprintf(stderr, "No se pudo abrir .sna: %s\n", filename);
-        return false;
-    }
+    if (!f) { fprintf(stderr, "No se pudo abrir .sna: %s\n", filename); return false; }
 
     uint8_t header[27];
-    if (fread(header, 1, 27, f) != 27) {
-        fclose(f);
-        fprintf(stderr, "Archivo .sna incompleto (header)\n");
-        return false;
-    }
+    if (fread(header, 1, 27, f) != 27) { fclose(f); fprintf(stderr, "Archivo .sna incompleto (header)\n"); return false; }
 
     // Restaurar registros Z80 (formato .sna 48K)
     cpu.i      = header[0];
@@ -632,20 +1242,15 @@ bool load_sna(const char* filename) {
     cpu.iy     = (header[16] << 8) | header[15];
     cpu.ix     = (header[18] << 8) | header[17];
     cpu.iff2   = header[19] ? 1 : 0;
-    cpu.r      = header[20];  // conserva bit 7
+    cpu.r      = header[20];
     cpu.af     = (header[22] << 8) | header[21];
     cpu.sp     = (header[24] << 8) | header[23];
     cpu.interrupt_mode = header[25];
     border_color = header[26] & 0x07;
 
-    if (fread(&memory[RAM_START], 1, 49152, f) != 49152) {
-        fclose(f);
-        fprintf(stderr, "Archivo .sna incompleto (RAM)\n");
-        return false;
-    }
+    if (fread(&memory[RAM_START], 1, 49152, f) != 49152) { fclose(f); fprintf(stderr, "Archivo .sna incompleto (RAM)\n"); return false; }
     fclose(f);
 
-    // PC desde la pila (pop)
     uint16_t sp = cpu.sp;
     cpu.pc = (memory[sp+1] << 8) | memory[sp];
     cpu.sp += 2;
@@ -677,23 +1282,17 @@ int main(int argc, char** argv) {
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                 SDL_TEXTUREACCESS_STATIC, FULL_WIDTH, FULL_HEIGHT);
 
-    if (!load_rom("zx48.rom")) {
-        fprintf(stderr, "No se encuentra zx48.rom\n");
-        return 1;
-    }
+    if (!load_rom("zx48.rom")) { fprintf(stderr, "No se encuentra zx48.rom\n"); return 1; }
 
-    // Inicializar CPU
     z80_init(&cpu);
     cpu.read_byte  = read_byte;
     cpu.write_byte = write_byte;
     cpu.port_in    = port_in;
     cpu.port_out   = port_out;
-
     cpu.pc = 0x0000;
     cpu.sp = 0x0000;
     cpu.interrupt_mode = 1;
 
-    // Audio
     SDL_AudioSpec want, have;
     SDL_zero(want);
     want.freq     = AUDIO_SAMPLE_RATE;
@@ -703,13 +1302,8 @@ int main(int argc, char** argv) {
     want.callback = audio_callback;
 
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (audio_dev == 0) {
-        fprintf(stderr, "Audio init falló: %s\n", SDL_GetError());
-    } else {
-        // Inicializa el beeper con la frecuencia REAL del dispositivo
-        beeper_init((double)have.freq);
-        SDL_PauseAudioDevice(audio_dev, 0);  // empieza reproduciendo
-    }
+    if (audio_dev == 0) { fprintf(stderr, "Audio init falló: %s\n", SDL_GetError()); }
+    else { beeper_init((double)have.freq); SDL_PauseAudioDevice(audio_dev, 0); }
 
     int frame_counter = 0;
     int flash_phase = 0;
@@ -720,6 +1314,8 @@ int main(int argc, char** argv) {
             load_tap(argv[1]);
         } else if (ext && strcasecmp(ext, ".sna") == 0) {
             load_sna(argv[1]);
+        } else if (ext && strcasecmp(ext, ".tzx") == 0) {
+            load_tzx(argv[1]);
         }
     }
 
@@ -730,28 +1326,18 @@ int main(int argc, char** argv) {
             z80_step_n(&cpu, 224);
             displayscanline(line, flash_phase);
 
-            cycles_done   += 224;           // puede replegarse
-            global_cycles += (uint64_t)224; // referencia estable para cinta y audio
+            cycles_done   += 224;
+            global_cycles += (uint64_t)224;
 
-            if (line == (FULL_HEIGHT -1)) {
-                // RST 38h por frame (IM1). Alternativamente en line==0.
-                z80_pulse_irq(&cpu, 1);
-            }
+            if (line == (FULL_HEIGHT -1)) z80_pulse_irq(&cpu, 1);
         }
 
-        // Mantén cycles_done estable por frame si quieres, pero NO toques global_cycles
         cycles_done -= CYCLES_PER_FRAME;
 
         frame_counter++;
-        if (frame_counter >= 16) { // flash ≈ 1.56 Hz
-            frame_counter = 0;
-            flash_phase = !flash_phase;
-        }
+        if (frame_counter >= 16) { frame_counter = 0; flash_phase = !flash_phase; }
 
         update_texture();
-
-        // Con PRESENTVSYNC no es necesario delay
-        //SDL_Delay(1);
     }
 
     if (audio_dev) SDL_CloseAudioDevice(audio_dev);
@@ -761,3 +1347,4 @@ int main(int argc, char** argv) {
     SDL_Quit();
     return 0;
 }
+
