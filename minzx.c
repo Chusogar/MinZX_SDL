@@ -308,7 +308,6 @@ static void list_tzx_blocks(const char* filename) {
 
             case 0x32: { // Archive Info: listar sus campos según la espec
                 uint16_t blen = rd_u16(f); file_pos += 2;
-				//printf("Vamos!!!!");
 #if 1
                 long end = file_pos + blen;
                 if (end > fsz) end = fsz; // defensa básica ante corrupción
@@ -322,7 +321,7 @@ static void list_tzx_blocks(const char* filename) {
                     if (file_pos + 1 > end) break;
                     uint8_t tid = rd_u8(f); file_pos += 1;
 
-                    if (file_pos + 2 > end) break;
+                    if (file_pos + 1 > end) break;
                     uint16_t slen = rd_u8(f); file_pos += 1;
 
                     long remain = end - file_pos; if (remain < 0) remain = 0;
@@ -344,7 +343,7 @@ static void list_tzx_blocks(const char* filename) {
 
                 if (file_pos < end) { fseek(f, end - file_pos, SEEK_CUR); file_pos = end; }
 #endif
-				file_pos += blen;
+                // (NO sumar file_pos += blen; ya hemos reposicionado a end)
             } break;
 
             case 0x33: { uint8_t n=rd_u8(f); file_pos++; fseek(f, n*3, SEEK_CUR); file_pos+=n*3; printf("  (hw %u)\n", n); } break;
@@ -513,23 +512,43 @@ bool load_tap(const char* filename) {
 static bool tzx_read_and_prepare_next_block(uint64_t now);
 
 static void tzx_prepare_standard_or_turbo(uint64_t now) {
-    tape.phase       = PH_PILOT;
-    tape.pulses_left = tape.pilot_pulses * 2;
-    tape.halfwave_ts = tape.t_pilot;
-    tape.next_edge_cycle = now + tape.halfwave_ts;
+    // Nivel base (EAR alto salvo que se especifique con 0x2B)
     tape.level = tape.initial_level_known ? tape.initial_level : true;
 
-    tape.data_pos = 0;
-    tape.cur_bit  = 7;
-    tape.pulse_of_bit = 0;
-    tape.cur_byte = (tape.blk_len>0) ? tape.blk[tape.data_pos++] : 0x00;
+    // Si hay piloto, se emite; si no, saltamos a SYNC o DATA
+    if (tape.pilot_pulses > 0 && tape.t_pilot > 0) {
+        tape.phase       = PH_PILOT;
+        tape.pulses_left = tape.pilot_pulses * 2;   // medias ondas
+        tape.halfwave_ts = tape.t_pilot;
+        tape.next_edge_cycle = now + tape.halfwave_ts;
+    } else if (tape.t_sync1 > 0) {
+        tape.phase       = PH_SYNC1;
+        tape.halfwave_ts = tape.t_sync1;
+        tape.next_edge_cycle = now + tape.halfwave_ts;
+    } else if (tape.t_bit0 || tape.t_bit1) {
+        tape.phase      = PH_DATA;
+        tape.data_pos   = 0;
+        tape.cur_bit    = 7;
+        tape.pulse_of_bit = 0;
+        tape.cur_byte   = (tape.blk_len > 0) ? tape.blk[tape.data_pos++] : 0x00;
+        bool b          = (tape.cur_byte & 0x80) != 0;
+        tape.halfwave_ts= halfwave_for_bit(b);
+        tape.next_edge_cycle = now + tape.halfwave_ts;
+    } else {
+        // No hay nada que emitir: solo pausa (si existe)
+        tape.phase = PH_PAUSE;
+        tape.next_edge_cycle = now + MS_TO_TSTATES(tape.pause_ms);
+    }
 }
 
 static bool tzx_ear_level_until(uint64_t now_cycle) {
     if (!tape.playing || !tape.f || tape.phase == PH_IDLE) return true;
 
     while (now_cycle >= tape.next_edge_cycle) {
-        tape.level = !tape.level;
+        // En PAUSE no hay flancos: nivel estable
+        if (tape.phase != PH_PAUSE) {
+            tape.level = !tape.level;
+        }
 
         switch (tape.phase) {
             case PH_PILOT:
@@ -639,6 +658,7 @@ static bool tzx_ear_level_until(uint64_t now_cycle) {
             } break;
 
             case PH_PAUSE:
+                // Pausa consumida → siguiente bloque (sin conmutar nivel)
                 if (!tzx_read_and_prepare_next_block(now_cycle)) {
                     tape.phase = PH_IDLE; tape.playing = false; tape.level = true;
                 }
@@ -697,15 +717,15 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
         } return true;
 
         case 0x11: { // Turbo
-            tape.t_pilot = rd_u16(tape.f);   tape.file_pos += 2;
-            tape.pilot_pulses = rd_u16(tape.f); tape.file_pos += 2;
-            tape.t_sync1 = rd_u16(tape.f);   tape.file_pos += 2;
-            tape.t_sync2 = rd_u16(tape.f);   tape.file_pos += 2;
-            tape.t_bit0  = rd_u16(tape.f);   tape.file_pos += 2;
-            tape.t_bit1  = rd_u16(tape.f);   tape.file_pos += 2;
-            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1;
-            tape.pause_ms = rd_u16(tape.f);  tape.file_pos += 2;
-            uint32_t dlen = rd_u24(tape.f);  tape.file_pos += 3;
+            tape.t_pilot = rd_u16(tape.f);      tape.file_pos += 2;
+            tape.t_sync1 = rd_u16(tape.f);      tape.file_pos += 2;
+            tape.t_sync2 = rd_u16(tape.f);      tape.file_pos += 2;
+            tape.t_bit0  = rd_u16(tape.f);      tape.file_pos += 2;
+            tape.t_bit1  = rd_u16(tape.f);      tape.file_pos += 2;
+            tape.pilot_pulses = rd_u16(tape.f); tape.file_pos += 2;            
+			{ uint8_t u = rd_u8(tape.f); tape.used_bits_last = (u == 0) ? 8 : u; } tape.file_pos += 1;
+            tape.pause_ms = rd_u16(tape.f);     tape.file_pos += 2;
+            uint32_t dlen = rd_u24(tape.f);     tape.file_pos += 3;
             free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
             if (!tape.blk) return false;
             fread(tape.blk, 1, dlen, tape.f); tape.file_pos += dlen;
@@ -732,7 +752,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
         case 0x14: { // Pure Data
             tape.t_bit0  = rd_u16(tape.f);    tape.file_pos += 2;
             tape.t_bit1  = rd_u16(tape.f);    tape.file_pos += 2;
-            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1;
+            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1; // en 0x14 la spec también usa 0→8; puedes normalizar si te da problemas
             tape.pause_ms = rd_u16(tape.f);   tape.file_pos += 2;
             uint32_t dlen = rd_u24(tape.f);   tape.file_pos += 3;
             free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
@@ -835,16 +855,16 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
         case 0x25: { printf("[TZX] 0x25 loop-end (remain=%u)\n", tape.loop.remaining); if (tape.loop.active && tape.loop.remaining > 1) { tape.loop.remaining--; fseek(tape.f, tape.loop.file_pos_at_loop, SEEK_SET); tape.file_pos = tape.loop.file_pos_at_loop; return tzx_read_and_prepare_next_block(now); } else { tape.loop.active = 0; return tzx_read_and_prepare_next_block(now);} }
 
         case 0x2A: { tape.phase = PH_IDLE; tape.playing = false; tape.level = true; printf("[TZX] 0x2A stop-if-48K → STOP\n"); return false; }
-        case 0x2B: { uint8_t lvl = rd_u8(tape.f); tape.file_pos += 1; tape.initial_level_known = true; tape.initial_level = (lvl != 0); printf("[TZX] 0x2B set-level=%u\n"); return tzx_read_and_prepare_next_block(now); }
+        case 0x2B: { uint8_t lvl = rd_u8(tape.f); tape.file_pos += 1; tape.initial_level_known = true; tape.initial_level = (lvl != 0); printf("[TZX] 0x2B set-level=%u\n", lvl); return tzx_read_and_prepare_next_block(now); }
 
         case 0x30: { uint8_t ln = rd_u8(tape.f); tape.file_pos += 1; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x30 text\n"); return tzx_read_and_prepare_next_block(now); }
         case 0x31: { uint8_t dur = rd_u8(tape.f); uint8_t ln = rd_u8(tape.f); tape.file_pos += 2; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x31 message %us\n", dur); return tzx_read_and_prepare_next_block(now); }
 
         case 0x32: { // Archive Info (metadatos; se muestra y se continúa)
             uint16_t blen = rd_u16(tape.f); tape.file_pos += 2;
-			printf("Longitud bloque completo: %d\n", blen);
+            printf("Longitud bloque completo: %d\n", blen);
             long end = tape.file_pos + blen;
-			printf("Posicion final: %d\n", end);
+            printf("Posicion final: %ld\n", end);
             if (end > tape.file_size) end = tape.file_size;
 
             printf("[TZX] 0x32 archive-info:\n");
@@ -858,7 +878,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
                 if (tape.file_pos + 1 > end) break;
                 uint8_t tid = rd_u8(tape.f); tape.file_pos += 1;
 
-                if (tape.file_pos + 2 > end) break;
+                if (tape.file_pos + 1 > end) break;
                 uint8_t slen = rd_u8(tape.f); tape.file_pos += 1;
 
                 long remain = end - tape.file_pos; if (remain < 0) remain = 0;
@@ -881,7 +901,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
 
             if (tape.file_pos < end) { fseek(tape.f, end - tape.file_pos, SEEK_CUR); tape.file_pos = end; }
 #endif
-			tape.file_pos += blen;
+            // (NO sumar tape.file_pos += blen; ya hemos posicionado a end)
             return tzx_read_and_prepare_next_block(now);
         }
 
@@ -1347,4 +1367,3 @@ int main(int argc, char** argv) {
     SDL_Quit();
     return 0;
 }
-
