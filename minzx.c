@@ -63,12 +63,6 @@ uint8_t keyboard[8]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 int      cycles_done   = 0;     // puede replegarse por frame
 uint64_t global_cycles = 0;     // SIEMPRE crece → referencia para cinta/audio
 
-// Audio (beeper)
-#define AUDIO_SAMPLE_RATE 44100
-#define AUDIO_BUFFER_SIZE 2048
-static SDL_AudioDeviceID audio_dev = 0;
-static bool speaker_state = false;   // estado lógico del bit 4 (para detectar flancos)
-
 // Colores ZX con alfa (0xAARRGGBB)
 uint32_t zx_colors[16] = {
     0xFF000000, 0xFF0000D8, 0xFFD80000, 0xFFD800D8,
@@ -77,46 +71,6 @@ uint32_t zx_colors[16] = {
     0xFF00FF00, 0xFF00FFFF, 0xFFFFFF00, 0xFFFFFFFF
 };
 
-// ─────────────────────────────────────────────────────────────
-// Beeper por eventos (edge-timestamped) en T-states → audio 44.1kHz
-// ─────────────────────────────────────────────────────────────
-#define BEEPER_EDGE_QUEUE_CAP 4096
-
-typedef struct {
-    double sample_rate;                 // p.ej., 44100
-    double tstates_per_sec;             // 3500000.0
-    double tstate_to_sample;            // sample_rate / tstates_per_sec
-    uint64_t last_cycle_processed;      // T-state del último punto sintetizado
-    bool     level;                     // nivel actual (false=-amp, true=+amp)
-    int16_t  amp_pos;                   // amplitud positiva
-    int16_t  amp_neg;                   // amplitud negativa
-    uint64_t edges[BEEPER_EDGE_QUEUE_CAP]; // cola de flancos (T-states absolutos)
-    int head;                           // escribe main thread (port_out)
-    int tail;                           // consume audio thread (callback)
-} beeper_t;
-
-static beeper_t beeper;
-
-static void beeper_init(double sample_rate) {
-    beeper.sample_rate       = sample_rate;
-    beeper.tstates_per_sec   = 3500000.0;
-    beeper.tstate_to_sample  = beeper.sample_rate / beeper.tstates_per_sec;
-    beeper.last_cycle_processed = global_cycles;
-    beeper.level             = false;
-    beeper.amp_pos           = 11000;
-    beeper.amp_neg           = -11000;
-    beeper.head = beeper.tail = 0;
-}
-
-static inline void beeper_push_edge_ts(uint64_t edge_cycle) {
-    int next_head = (beeper.head + 1) % BEEPER_EDGE_QUEUE_CAP;
-    if (next_head == beeper.tail) {
-        // cola llena → descarta el más antiguo
-        beeper.tail = (beeper.tail + 1) % BEEPER_EDGE_QUEUE_CAP;
-    }
-    beeper.edges[beeper.head] = edge_cycle;
-    beeper.head = next_head;
-}
 
 // ─────────────────────────────────────────────────────────────
 // Utilidades lectura LE
@@ -1033,14 +987,6 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         border_color   = val & 0x07;
         last_fe_write  = val;
 
-        // Beeper: bit 4
-        bool new_state = (val & 0x10) != 0;
-        if (new_state != speaker_state) {
-            speaker_state = new_state;
-            if (audio_dev) SDL_LockAudioDevice(audio_dev);
-            beeper_push_edge_ts(global_cycles);
-            if (audio_dev) SDL_UnlockAudioDevice(audio_dev);
-        }
     }
 }
 
@@ -1114,45 +1060,6 @@ void update_texture() {
     SDL_RenderPresent(renderer);
 }
 
-// ─────────────────────────────────────────────────────────────
-// Audio callback (beeper por eventos)
-// ─────────────────────────────────────────────────────────────
-void audio_callback(void* userdata, uint8_t* stream, int len) {
-    (void)userdata;
-    int16_t* out = (int16_t*)stream;
-    int samples_to_write = len / sizeof(int16_t);
-
-    int produced = 0;
-    while (produced < samples_to_write) {
-        uint64_t next_edge = (beeper.tail != beeper.head) ? beeper.edges[beeper.tail] : UINT64_MAX;
-
-        double samples_until_edge_d;
-        if (next_edge == UINT64_MAX) {
-            samples_until_edge_d = (double)(samples_to_write - produced);
-        } else {
-            uint64_t delta_tstates = (next_edge > beeper.last_cycle_processed) ? (next_edge - beeper.last_cycle_processed) : 0;
-            samples_until_edge_d = delta_tstates * beeper.tstate_to_sample;
-            if (samples_until_edge_d < 0.0) samples_until_edge_d = 0.0;
-        }
-
-        int chunk = (int)samples_until_edge_d;
-        if (chunk <= 0) {
-            beeper.level = !beeper.level;
-            beeper.last_cycle_processed = next_edge;
-            if (beeper.tail != beeper.head) beeper.tail = (beeper.tail + 1) % BEEPER_EDGE_QUEUE_CAP;
-            continue;
-        }
-
-        if (chunk > (samples_to_write - produced)) chunk = samples_to_write - produced;
-
-        int16_t val = beeper.level ? beeper.amp_pos : beeper.amp_neg;
-        for (int i = 0; i < chunk; ++i) out[produced++] = val;
-
-        double tstates_advanced_d = (double)chunk / beeper.tstate_to_sample;
-        uint64_t tstates_advanced = (uint64_t)(tstates_advanced_d + 0.5);
-        beeper.last_cycle_processed += tstates_advanced;
-    }
-}
 
 // ─────────────────────────────────────────────────────────────
 // Teclado (eventos)
@@ -1313,17 +1220,6 @@ int main(int argc, char** argv) {
     cpu.sp = 0x0000;
     cpu.interrupt_mode = 1;
 
-    SDL_AudioSpec want, have;
-    SDL_zero(want);
-    want.freq     = AUDIO_SAMPLE_RATE;
-    want.format   = AUDIO_S16SYS;
-    want.channels = 1;
-    want.samples  = AUDIO_BUFFER_SIZE;
-    want.callback = audio_callback;
-
-    audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (audio_dev == 0) { fprintf(stderr, "Audio init falló: %s\n", SDL_GetError()); }
-    else { beeper_init((double)have.freq); SDL_PauseAudioDevice(audio_dev, 0); }
 
     int frame_counter = 0;
     int flash_phase = 0;
@@ -1360,7 +1256,6 @@ int main(int argc, char** argv) {
         update_texture();
     }
 
-    if (audio_dev) SDL_CloseAudioDevice(audio_dev);
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
