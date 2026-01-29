@@ -1,10 +1,10 @@
-
 /*
  * ZX Spectrum 48K Emulator con SDL2 + JGZ80
  * - Carga .TAP por pulsos (pilot/sync/data) compatible ROM
  * - Carga .TZX por pulsos:
  *   - Soportados: 0x00(=0x10), 0x02(=0x12), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
- *                 0x18 (CSW raw sin compresión), 0x20, 0x24/0x25, 0x2A, 0x2B,
+ *                 0x18 (CSW raw sin compresión), 0x19 (Generalized Data),
+ *                 0x20, 0x21, 0x22, 0x24/0x25, 0x2A, 0x2B,
  *                 0x30, 0x31, 0x32, 0x33, 0x35, 0x5A
  * - Carga .SNA (48K)
  * - BRIGHT aplicado a ink y paper
@@ -63,6 +63,21 @@ uint8_t keyboard[8]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 int      cycles_done   = 0;     // puede replegarse por frame
 uint64_t global_cycles = 0;     // SIEMPRE crece → referencia para cinta/audio
 
+// Configuración de audio
+SDL_AudioDeviceID audio_dev;
+SDL_AudioSpec want;
+
+#define SAMPLE_RATE 44100
+#define CPU_HZ 3500000
+#define AUDIO_SAMPLES_PER_FRAME (SAMPLE_RATE / 100) // Aprox 882 muestras por frame
+#define BUFFER_SIZE (256)
+
+uint32_t last_audio_tstates = 0; // T-states acumulados desde la última muestra
+int16_t audio_buffer[BUFFER_SIZE];
+int audio_ptr = 0;
+uint8_t current_speaker_level = 0; // Estado actual del bit 4 de 0xFE
+
+
 // Colores ZX con alfa (0xAARRGGBB)
 uint32_t zx_colors[16] = {
     0xFF000000, 0xFF0000D8, 0xFFD80000, 0xFFD800D8,
@@ -116,7 +131,7 @@ typedef struct {
     uint16_t used_bits_last;         // 0 => 8
     uint32_t pause_ms;
 
-    // Secuencias (0x13)
+    // Secuencias (0x13 / 0x18 / 0x19)
     uint16_t* pulse_seq;
     int       pulse_seq_n;
     int       pulse_seq_i;
@@ -142,10 +157,15 @@ typedef struct {
     // Loop (0x24/0x25)
     struct { long file_pos_at_loop; uint16_t remaining; int active; } loop;
 
+    // Grupos (0x21/0x22) - no afecta reproducción; útil para validar
+    int group_depth;
+
 } tape_t;
 
 static tape_t tape = {0};
 static const char* tape_filename = NULL;
+
+bool load_tap(const char* filename);
 
 // ─────────────────────────────────────────────────────────────
 // Timings TAP por defecto (T-states) @3.5MHz
@@ -260,11 +280,11 @@ static void list_tzx_blocks(const char* filename) {
             case 0x30: { uint8_t l=rd_u8(f); file_pos++; fseek(f,l,SEEK_CUR); file_pos+=l; printf("  (text)\n"); } break;
             case 0x31: { uint8_t d=rd_u8(f); uint8_t l=rd_u8(f); file_pos+=2; fseek(f,l,SEEK_CUR); file_pos+=l; printf("  (message %us)\n", d); } break;
 
-            case 0x32: { // Archive Info: listar sus campos según la espec
+            case 0x32: { // Archive Info: listar sus campos
                 uint16_t blen = rd_u16(f); file_pos += 2;
 #if 1
                 long end = file_pos + blen;
-                if (end > fsz) end = fsz; // defensa básica ante corrupción
+                if (end > fsz) end = fsz;
 
                 if (file_pos >= end) { printf("  (archive info vacio)\n"); break; }
 
@@ -297,7 +317,6 @@ static void list_tzx_blocks(const char* filename) {
 
                 if (file_pos < end) { fseek(f, end - file_pos, SEEK_CUR); file_pos = end; }
 #endif
-                // (NO sumar file_pos += blen; ya hemos reposicionado a end)
             } break;
 
             case 0x33: { uint8_t n=rd_u8(f); file_pos++; fseek(f, n*3, SEEK_CUR); file_pos+=n*3; printf("  (hw %u)\n", n); } break;
@@ -336,11 +355,11 @@ static bool tap_read_next_block() {
     tape.file_pos += len;
     tape.blk_len = len;
 
-    tape.t_pilot       = TS_PILOT;
-    tape.t_sync1       = TS_SYNC1;
-    tape.t_sync2       = TS_SYNC2;
-    tape.t_bit0        = TS_BIT0;
-    tape.t_bit1        = TS_BIT1;
+    tape.t_pilot       = 2168;
+    tape.t_sync1       = 667;
+    tape.t_sync2       = 735;
+    tape.t_bit0        = 855;
+    tape.t_bit1        = 1710;
     tape.used_bits_last= 8;
     tape.pilot_pulses  = (tape.blk[0] == 0x00) ? 8063 : 3223;
     tape.pause_ms      = 1000;
@@ -433,35 +452,42 @@ static bool tap_ear_level_until(uint64_t now_cycle) {
     return tape.level;
 }
 
-bool load_tap(const char* filename) {
-    list_tap_blocks(filename); // listado completo al cargar
+// ─────────────────────────────────────────────────────────────
+// Helpers específicos para 0x19 (Generalized Data)
+// ─────────────────────────────────────────────────────────────
+static inline int ceil_log2_u16(int v) {
+    if (v <= 1) return 1;
+    int n = 0, p = 1;
+    while (p < v) { p <<= 1; n++; }
+    return n;
+}
 
-    if (tape.f) { fclose(tape.f); tape.f = NULL; }
-    tape.f = fopen(filename, "rb");
-    if (!tape.f) { printf("No se pudo abrir %s\n", filename); tape.playing = false; return false; }
+typedef struct {
+    uint8_t  flags;    // b0..b1: 00 edge, 01 same, 10 force low, 11 force high
+    uint16_t *pulses;  // lista de medias-ondas (T-states) sin los ceros de terminación
+    int      npulses;  // número de medias-ondas válidas
+} tzx19_symdef_t;
 
-    fseek(tape.f, 0, SEEK_END); tape.file_size = ftell(tape.f);
-    fseek(tape.f, 0, SEEK_SET); tape.file_pos = 0;
-
-    free(tape.blk); tape.blk = NULL;
-    free(tape.pulse_seq); tape.pulse_seq = NULL;
-    tape.blk_len = 0;
-    tape.fmt = TAPE_FMT_TAP;
-    tape.speed   = 1.0;
-    tape.playing = true;
-    tape.initial_level_known = false;
-
-    if (!tap_read_next_block()) { printf("TAP vacío.\n"); tape.playing = false; return false; }
-    start_block_emission(global_cycles);
-    border_color = 7;
-
-    printf("TAP cargado: %s (%ld bytes)\n", filename, tape.file_size);
-    tape_filename = filename;
+// Añade o fusiona una media-onda en la secuencia de salida
+static bool push_or_merge_halfwave(uint16_t **seq, int *cap, int *n, uint16_t dur, bool merge) {
+    if (dur == 0) return true; // 0 en definición indica fin; no se añade
+    if (merge && *n > 0) {
+        uint32_t ext = (uint32_t)(*seq)[*n - 1] + (uint32_t)dur;
+        (*seq)[*n - 1] = (ext > 65535) ? 65535 : (uint16_t)ext;
+        return true;
+    }
+    if (*n >= *cap) {
+        int ncap = (*cap == 0) ? 512 : (*cap * 2);
+        uint16_t *tmp = (uint16_t*)realloc(*seq, sizeof(uint16_t)*ncap);
+        if (!tmp) return false;
+        *seq = tmp; *cap = ncap;
+    }
+    (*seq)[(*n)++] = dur ? dur : 1;
     return true;
 }
 
 // ─────────────────────────────────────────────────────────────
-// TZX  (incluye alias 0x00→0x10, 0x02→0x12 y CSW 0x18 básico + Trazas)
+// TZX  (incluye alias 0x00→0x10, 0x02→0x12, 0x18 básico, 0x19 completo + Trazas)
 // ─────────────────────────────────────────────────────────────
 static bool tzx_read_and_prepare_next_block(uint64_t now);
 
@@ -677,7 +703,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
             tape.t_bit0  = rd_u16(tape.f);      tape.file_pos += 2;
             tape.t_bit1  = rd_u16(tape.f);      tape.file_pos += 2;
             tape.pilot_pulses = rd_u16(tape.f); tape.file_pos += 2;            
-			{ uint8_t u = rd_u8(tape.f); tape.used_bits_last = (u == 0) ? 8 : u; } tape.file_pos += 1;
+            { uint8_t u = rd_u8(tape.f); tape.used_bits_last = (u == 0) ? 8 : u; } tape.file_pos += 1;
             tape.pause_ms = rd_u16(tape.f);     tape.file_pos += 2;
             uint32_t dlen = rd_u24(tape.f);     tape.file_pos += 3;
             free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
@@ -706,7 +732,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
         case 0x14: { // Pure Data
             tape.t_bit0  = rd_u16(tape.f);    tape.file_pos += 2;
             tape.t_bit1  = rd_u16(tape.f);    tape.file_pos += 2;
-            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1; // en 0x14 la spec también usa 0→8; puedes normalizar si te da problemas
+            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1; // en 0x14 la spec también usa 0→8
             tape.pause_ms = rd_u16(tape.f);   tape.file_pos += 2;
             uint32_t dlen = rd_u24(tape.f);   tape.file_pos += 3;
             free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
@@ -717,8 +743,10 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
             tape.phase = PH_DATA;
             tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
             tape.cur_byte = (tape.blk_len>0)? tape.blk[tape.data_pos++] : 0x00;
-            bool b = (tape.cur_byte & 0x80) != 0;
-            tape.halfwave_ts = halfwave_for_bit(b);
+            {
+                bool b = (tape.cur_byte & 0x80) != 0;
+                tape.halfwave_ts = halfwave_for_bit(b);
+            }
             tape.level = tape.initial_level_known ? tape.initial_level : true;
             tape.next_edge_cycle = now + tape.halfwave_ts;
             printf("[TZX] 0x14 pure-data: len=%u bit0=%u bit1=%u usedLast=%u pause=%u\n",
@@ -761,7 +789,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
             // Convertimos CSW raw a secuencia de medias ondas si compresión=0:
             if (comp == 0 && data_len >= 2) {
                 uint32_t pairs = data_len / 2;
-                free(tape.pulse_seq); tape.pulse_seq = (uint16_t*)malloc(sizeof(uint16_t)*pairs);
+                free(tape.pulse_seq); tape.pulse_seq = (uint16_t*)malloc(sizeof(uint16_t)*pairs*4);
                 if (!tape.pulse_seq) return false;
 
                 int n=0;
@@ -794,6 +822,173 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
             }
         } return true;
 
+        case 0x19: { // Generalized Data Block (implementación completa)
+            uint32_t blen = rd_u32(tape.f); tape.file_pos += 4;
+            long block_end = tape.file_pos + blen;
+
+            tape.pause_ms = rd_u16(tape.f);        tape.file_pos += 2;
+            uint32_t TOTP  = rd_u32(tape.f);        tape.file_pos += 4; // pilot/sync total symbols
+            uint8_t  NPP   = rd_u8(tape.f);         tape.file_pos += 1; // max pulses per pilot/sync symbol
+            uint8_t  ASPx  = rd_u8(tape.f);         tape.file_pos += 1; // alphabet size (0=256)
+            uint32_t TOTD  = rd_u32(tape.f);        tape.file_pos += 4; // data total symbols
+            uint8_t  NPD   = rd_u8(tape.f);         tape.file_pos += 1; // max pulses per data symbol
+            uint8_t  ASDx  = rd_u8(tape.f);         tape.file_pos += 1; // alphabet size (0=256)
+
+            int ASP = (ASPx == 0) ? 256 : ASPx;
+            int ASD = (ASDx == 0) ? 256 : ASDx;
+
+            // Salida: secuencia de medias ondas
+            uint16_t *seq = NULL; int seq_cap = 0, seq_n = 0;
+
+            // Nivel inicial
+            bool init_level = tape.initial_level_known ? tape.initial_level : true;
+
+            // Tablas de símbolos para Pilot/Sync
+            tzx19_symdef_t *pilot = NULL;
+            if (TOTP > 0) {
+                pilot = (tzx19_symdef_t*)calloc((size_t)ASP, sizeof(tzx19_symdef_t));
+                if (!pilot) goto tzx19_fail;
+
+                for (int i = 0; i < ASP; ++i) {
+                    pilot[i].flags = rd_u8(tape.f); tape.file_pos += 1;
+                    pilot[i].pulses = (uint16_t*)malloc(sizeof(uint16_t) * NPP);
+                    if (!pilot[i].pulses) goto tzx19_fail;
+                    pilot[i].npulses = 0;
+                    for (int j = 0; j < NPP; ++j) {
+                        uint16_t d = rd_u16(tape.f); tape.file_pos += 2;
+                        if (d) pilot[i].pulses[pilot[i].npulses++] = d;
+                    }
+                }
+
+                // PRLE (TOTP entradas): símbolo + repeticiones
+                for (uint32_t k = 0; k < TOTP; ++k) {
+                    uint8_t sym = rd_u8(tape.f);     tape.file_pos += 1;
+                    uint16_t rep = rd_u16(tape.f);   tape.file_pos += 2;
+                    if (sym >= ASP) sym %= ASP;
+
+                    for (uint16_t r = 0; r < rep; ++r) {
+                        tzx19_symdef_t *S = &pilot[sym];
+
+                        uint8_t pol = (S->flags & 0x03);
+
+                        // nivel actual según sec_n
+                        bool current_level = (seq_n % 2 == 0) ? init_level : !init_level;
+
+                        bool merge_first = false;
+                        if      (pol == 0x01) merge_first = (seq_n > 0);                     // same level → sin flanco
+                        else if (pol == 0x02) merge_first = (seq_n > 0) && (current_level == false); // force low
+                        else if (pol == 0x03) merge_first = (seq_n > 0) && (current_level == true);  // force high
+
+                        for (int p = 0; p < S->npulses; ++p) {
+                            if (!push_or_merge_halfwave(&seq, &seq_cap, &seq_n, S->pulses[p], (p==0) && merge_first))
+                                goto tzx19_fail;
+                        }
+                    }
+                }
+            }
+
+            // Tabla de símbolos de datos
+            tzx19_symdef_t *data = NULL;
+            uint32_t bytes_consumed = 0;
+            if (TOTD > 0) {
+                data = (tzx19_symdef_t*)calloc((size_t)ASD, sizeof(tzx19_symdef_t));
+                if (!data) goto tzx19_fail;
+
+                for (int i = 0; i < ASD; ++i) {
+                    data[i].flags = rd_u8(tape.f); tape.file_pos += 1;
+                    data[i].pulses = (uint16_t*)malloc(sizeof(uint16_t) * NPD);
+                    if (!data[i].pulses) goto tzx19_fail;
+                    data[i].npulses = 0;
+                    for (int j = 0; j < NPD; ++j) {
+                        uint16_t d = rd_u16(tape.f); tape.file_pos += 2;
+                        if (d) data[i].pulses[data[i].npulses++] = d;
+                    }
+                }
+
+                int NB = ceil_log2_u16(ASD);
+                uint32_t DS = (uint32_t)((NB * (uint64_t)TOTD + 7) / 8);
+
+                uint8_t cur = 0; int rem_bits = 0;
+
+                for (uint32_t k = 0; k < TOTD; ++k) {
+                    uint32_t sym = 0;
+                    for (int i = 0; i < NB; ++i) {
+                        if (rem_bits == 0) {
+                            cur = rd_u8(tape.f); tape.file_pos += 1;
+                            rem_bits = 8;
+                            bytes_consumed++;
+                        }
+                        sym = (sym << 1) | ((cur >> (rem_bits - 1)) & 1u);
+                        rem_bits--;
+                    }
+
+                    if (sym >= (uint32_t)ASD) sym %= ASD; // defensa
+                    tzx19_symdef_t *S = &data[sym];
+
+                    uint8_t pol = (S->flags & 0x03);
+                    bool current_level = (seq_n % 2 == 0) ? init_level : !init_level;
+
+                    bool merge_first = false;
+                    if      (pol == 0x01) merge_first = (seq_n > 0);
+                    else if (pol == 0x02) merge_first = (seq_n > 0) && (current_level == false);
+                    else if (pol == 0x03) merge_first = (seq_n > 0) && (current_level == true);
+
+                    for (int p = 0; p < S->npulses; ++p) {
+                        if (!push_or_merge_halfwave(&seq, &seq_cap, &seq_n, S->pulses[p], (p==0) && merge_first))
+                            goto tzx19_fail;
+                    }
+                }
+
+                // Saltar bytes de padding (si los hubiera) hasta consumir DS
+                if (bytes_consumed < DS) {
+                    uint32_t skip = DS - bytes_consumed;
+                    fseek(tape.f, skip, SEEK_CUR);
+                    tape.file_pos += skip;
+                }
+            } else {
+                // Si no hay TOTD, saltar a block_end si queda
+                if (tape.file_pos < block_end) {
+                    fseek(tape.f, block_end - tape.file_pos, SEEK_CUR);
+                    tape.file_pos = block_end;
+                }
+            }
+
+            // Liberar tablas auxiliares
+            if (pilot) {
+                for (int i = 0; i < ((TOTP>0)? ((ASPx==0)?256:ASPx) : 0); ++i) free(pilot[i].pulses);
+                free(pilot);
+            }
+            if (data) {
+                for (int i = 0; i < ((TOTD>0)? ((ASDx==0)?256:ASDx) : 0); ++i) free(data[i].pulses);
+                free(data);
+            }
+
+            // Activar emisión como secuencia de medias ondas
+            free(tape.pulse_seq);
+            tape.pulse_seq   = seq;
+            tape.pulse_seq_n = seq_n;
+            tape.pulse_seq_i = 0;
+
+            tape.phase = PH_PULSE_SEQ;
+            tape.halfwave_ts = (seq_n > 0) ? tape.pulse_seq[0] : 1;
+            tape.level = init_level;
+            tape.next_edge_cycle = now + tape.halfwave_ts;
+
+            printf("[TZX] 0x19 GDB: pulses=%d pause=%ums (ASP=%d,NPP=%d; ASD=%d,NPD=%d; TOTP=%u; TOTD=%u)\n",
+                   seq_n, tape.pause_ms, (ASPx==0)?256:ASPx, NPP, (ASDx==0)?256:ASDx, NPD, TOTP, TOTD);
+
+            return true;
+
+tzx19_fail:
+            fprintf(stderr, "[TZX] 0x19: error de memoria o lectura; se intenta continuar.\n");
+            if (pilot) { for (int i = 0; i < ((ASPx==0)?256:ASPx); ++i) free(pilot[i].pulses); free(pilot); }
+            if (data)  { for (int i = 0; i < ((ASDx==0)?256:ASDx); ++i) free(data[i].pulses);  free(data);  }
+            free(seq);
+            // Saltar al final del bloque e intentar seguir
+            fseek(tape.f, block_end, SEEK_SET); tape.file_pos = block_end;
+            return tzx_read_and_prepare_next_block(now);
+        }
+
         case 0x20: { // Pause
             uint16_t ms = rd_u16(tape.f); tape.file_pos += 2;
             if (ms == 0) { tape.phase = PH_IDLE; tape.playing = false; tape.level = true; printf("[TZX] 0x20 pause=0 (stop)\n"); return false; }
@@ -802,8 +997,26 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
             printf("[TZX] 0x20 pause=%u\n", ms);
         } return true;
 
-        case 0x21: { uint8_t ln = rd_u8(tape.f); tape.file_pos += 1; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x21 group-start\n"); return tzx_read_and_prepare_next_block(now); }
-        case 0x22: { printf("[TZX] 0x22 group-end\n"); return tzx_read_and_prepare_next_block(now); }
+        case 0x21: { // Group start (informativo)
+            uint8_t ln = rd_u8(tape.f); tape.file_pos += 1;
+            char name[256];
+            int rd = (ln < 255) ? ln : 255;
+            if (rd > 0) fread(name, 1, rd, tape.f);
+            tape.file_pos += rd;
+            name[ (rd>0)? rd : 0 ] = 0;
+            if (ln > rd) { fseek(tape.f, ln - rd, SEEK_CUR); tape.file_pos += (ln - rd); }
+
+            if (tape.group_depth == 0) tape.group_depth = 1;
+            else fprintf(stderr, "[TZX] 0x21: grupo anidado no permitido por la spec.\n");
+            printf("[TZX] 0x21 group-start: \"%s\"\n", name);
+            return tzx_read_and_prepare_next_block(now);
+        }
+
+        case 0x22: { // Group end (informativo)
+            if (tape.group_depth > 0) tape.group_depth = 0;
+            printf("[TZX] 0x22 group-end\n");
+            return tzx_read_and_prepare_next_block(now);
+        }
 
         case 0x24: { uint16_t count = rd_u16(tape.f); tape.file_pos += 2; tape.loop.file_pos_at_loop = ftell(tape.f); tape.loop.remaining = count; tape.loop.active = 1; printf("[TZX] 0x24 loop-start x%u\n", count); return tzx_read_and_prepare_next_block(now); }
         case 0x25: { printf("[TZX] 0x25 loop-end (remain=%u)\n", tape.loop.remaining); if (tape.loop.active && tape.loop.remaining > 1) { tape.loop.remaining--; fseek(tape.f, tape.loop.file_pos_at_loop, SEEK_SET); tape.file_pos = tape.loop.file_pos_at_loop; return tzx_read_and_prepare_next_block(now); } else { tape.loop.active = 0; return tzx_read_and_prepare_next_block(now);} }
@@ -863,14 +1076,6 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
         case 0x35: { fseek(tape.f, 16, SEEK_CUR); tape.file_pos += 16; { uint32_t ln = rd_u32(tape.f); tape.file_pos += 4; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; } printf("[TZX] 0x35 custom\n"); return tzx_read_and_prepare_next_block(now); }
         case 0x5A: { uint32_t ln = rd_u32(tape.f); tape.file_pos += 4; fseek(tape.f, ln, SEEK_CUR); tape.file_pos += ln; printf("[TZX] 0x5A glue\n"); return tzx_read_and_prepare_next_block(now); }
 
-        // 0x19 GDB (no implementado): saltamos si viene con longitud explícita (en spec avanzada)
-        case 0x19: {
-            uint32_t blen = rd_u32(tape.f); tape.file_pos += 4;
-            fseek(tape.f, blen, SEEK_CUR); tape.file_pos += blen;
-            printf("[TZX] 0x19 GDB (saltado len=%u)\n", blen);
-            return tzx_read_and_prepare_next_block(now);
-        }
-
         default:
             fprintf(stderr, "[TZX] Bloque 0x%02X no soportado.\n", id);
             return false;
@@ -901,6 +1106,7 @@ bool load_tzx(const char* filename) {
     tape.playing = false;
     tape.initial_level_known = false;
     tape.loop.active = 0;
+    tape.group_depth = 0;
 
     if (!tzx_read_and_prepare_next_block(global_cycles)) { tape.playing=false; return false; }
     border_color = 7;
@@ -917,6 +1123,34 @@ static inline bool get_current_ear_level_from_tape(void) {
     if (tape.fmt == TAPE_FMT_TZX) return tzx_ear_level_until(global_cycles);
     if (tape.fmt == TAPE_FMT_TAP) return tap_ear_level_until(global_cycles);
     return true; // sin cinta → EAR alto
+}
+
+void generate_audio(uint32_t current_tstates) {
+    uint32_t delta_t = current_tstates - last_audio_tstates;
+    
+    // Convertimos t-states a número de muestras
+    // Muestras = (T-states * SampleRate) / CPU_Freq
+    int samples_to_render = (delta_t * SAMPLE_RATE) / CPU_HZ;
+
+    for (int i = 0; i < samples_to_render; i++) {
+        if (audio_ptr < BUFFER_SIZE) 
+        {
+            // Amplificamos el bit (0 o 1) a un valor de 16 bits
+            audio_buffer[audio_ptr++] = current_speaker_level ? 8000 : -8000;
+        }
+
+        // Si el buffer se llena, lo enviamos a SDL
+        if (audio_ptr >= BUFFER_SIZE) 
+        {
+            SDL_QueueAudio(audio_dev, audio_buffer, BUFFER_SIZE * sizeof(int16_t));
+            audio_ptr = 0;
+        }
+    }
+
+    // Actualizamos el contador de tiempo procesado
+    if (samples_to_render > 0) {
+        last_audio_tstates = current_tstates;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -976,17 +1210,27 @@ uint8_t port_in(z80* z, uint16_t port) {
         // Bit 6 = EAR desde cinta
         bool ear = get_current_ear_level_from_tape();
         if (ear) res |= 0x40; else res &= ~0x40;
+        current_speaker_level = (ear) ? 1 : 0;
+        
     }
 
     return res;
 }
+
+
 
 void port_out(z80* z, uint16_t port, uint8_t val) {
     (void)z;
     if ((port & 1) == 0) {
         border_color   = val & 0x07;
         last_fe_write  = val;
-
+        
+        // Antes de cambiar el valor, generamos el audio con el nivel anterior
+        // hasta el momento exacto del cambio (t_states actuales)
+        generate_audio(cycles_done); 
+        
+        // El bit 4 controla el altavoz
+        current_speaker_level = (val & 0x10) ? 1 : 0;
     }
 }
 
@@ -1191,12 +1435,57 @@ bool load_sna(const char* filename) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Carga TAP
+// ─────────────────────────────────────────────────────────────
+bool load_tap(const char* filename) {
+    list_tap_blocks(filename); // listado completo al cargar
+
+    if (tape.f) { fclose(tape.f); tape.f = NULL; }
+    tape.f = fopen(filename, "rb");
+    if (!tape.f) { printf("No se pudo abrir %s\n", filename); tape.playing = false; return false; }
+
+    fseek(tape.f, 0, SEEK_END); tape.file_size = ftell(tape.f);
+    fseek(tape.f, 0, SEEK_SET); tape.file_pos = 0;
+
+    free(tape.blk); tape.blk = NULL;
+    free(tape.pulse_seq); tape.pulse_seq = NULL;
+    tape.blk_len = 0;
+    tape.fmt = TAPE_FMT_TAP;
+    tape.speed   = 1.0;
+    tape.playing = true;
+    tape.initial_level_known = false;
+
+    if (!tap_read_next_block()) { printf("TAP vacío.\n"); tape.playing = false; return false; }
+    start_block_emission(global_cycles);
+    border_color = 7;
+
+    printf("TAP cargado: %s (%ld bytes)\n", filename, tape.file_size);
+    tape_filename = filename;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
+    }
+
+    SDL_memset(&want, 0, sizeof(want));
+    want.freq = SAMPLE_RATE;
+    want.format = AUDIO_S16SYS; // 16 bits con signo (endian nativo)
+    want.channels = 1;          // Mono
+    want.samples = 1024;        // Tamaño del buffer interno de SDL
+    want.callback = NULL;       // Usaremos SDL_QueueAudio en su lugar
+
+    audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+
+    if (audio_dev == 0) {
+        printf("No se pudo abrir el audio: %s\n", SDL_GetError());
+    } else {
+        SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
 
     window = SDL_CreateWindow("Minimal ZX 48K",
@@ -1237,23 +1526,31 @@ int main(int argc, char** argv) {
 
     while (true) {
         handle_input();
-
+        
         for (int line = 0; line < FULL_HEIGHT; line++) {
             z80_step_n(&cpu, 224);
             displayscanline(line, flash_phase);
-
-            cycles_done   += 224;
+            
+            cycles_done   += (224);
             global_cycles += (uint64_t)224;
+            //generate_audio(cycles_done);
 
-            if (line == (FULL_HEIGHT -1)) z80_pulse_irq(&cpu, 1);
+            if (line == (FULL_HEIGHT -1)) {z80_pulse_irq(&cpu, 1); /*generate_audio(69888);*/}
         }
 
         cycles_done -= CYCLES_PER_FRAME;
 
         frame_counter++;
+
         if (frame_counter >= 16) { frame_counter = 0; flash_phase = !flash_phase; }
 
         update_texture();
+
+        generate_audio(69888);
+        cycles_done = 0; 
+        last_audio_tstates = 0;
+
+        //SDL_Delay(15);
     }
 
     SDL_DestroyTexture(texture);
