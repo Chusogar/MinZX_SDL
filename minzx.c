@@ -69,8 +69,8 @@ SDL_AudioSpec want;
 
 #define SAMPLE_RATE 44100
 #define CPU_HZ 3500000
-#define AUDIO_SAMPLES_PER_FRAME (SAMPLE_RATE / 100) // Aprox 882 muestras por frame
-#define BUFFER_SIZE (256)
+#define AUDIO_SAMPLES_PER_FRAME (SAMPLE_RATE / 50) // Aprox 882 muestras por frame
+#define BUFFER_SIZE (1024)
 
 uint32_t last_audio_tstates = 0; // T-states acumulados desde la última muestra
 int16_t audio_buffer[BUFFER_SIZE];
@@ -999,12 +999,12 @@ tzx19_fail:
 
         case 0x21: { // Group start (informativo)
             uint8_t ln = rd_u8(tape.f); tape.file_pos += 1;
-            char name[256];
-            int rd = (ln < 255) ? ln : 255;
+            char name[ln];
+            int rd = ln;//(ln < 255) ? ln : 255;
             if (rd > 0) fread(name, 1, rd, tape.f);
             tape.file_pos += rd;
             name[ (rd>0)? rd : 0 ] = 0;
-            if (ln > rd) { fseek(tape.f, ln - rd, SEEK_CUR); tape.file_pos += (ln - rd); }
+            //if (ln > rd) { fseek(tape.f, ln - rd, SEEK_CUR); tape.file_pos += (ln - rd); }
 
             if (tape.group_depth == 0) tape.group_depth = 1;
             else fprintf(stderr, "[TZX] 0x21: grupo anidado no permitido por la spec.\n");
@@ -1193,7 +1193,15 @@ uint8_t port_in(z80* z, uint16_t port) {
     (void)z;
     uint8_t res = 0xFF;
 
+	/*if ((port&0xff) != 254)
+	{
+		printf("puerto %d\n", (port&0xff));
+	}*/
+
+	
+
     if ((port & 1) == 0) { // FE
+		res = 0xbf;
         uint8_t hi = port >> 8;
 
         // Teclado
@@ -1202,17 +1210,45 @@ uint8_t port_in(z80* z, uint16_t port) {
                 res &= keyboard[r];
 
         // Bit 5 = 1 en 48K (sin MIC)
-        res |= 0x20;
+        //
+		//res |= 0x20;
 
         // Bit 7 = espejo del bit 3 del último OUT a FE
-        if (last_fe_write & 0x08) res &= ~0x80; else res |= 0x80;
+        //if (last_fe_write & 0x08) res &= ~0x80; else res |= 0x80;
 
-        // Bit 6 = EAR desde cinta
-        bool ear = get_current_ear_level_from_tape();
-        if (ear) res |= 0x40; else res &= ~0x40;
-        current_speaker_level = (ear) ? 1 : 0;
+		if (tape.playing) {
+            //Tape::Read();
+            //bitWrite(data,6,Tape::tapeEarBit);
+			bool ear = get_current_ear_level_from_tape();
+			if (ear) res |= 0x40; else res &= ~0x40;
+			current_speaker_level = (ear) ? 1 : 0;
+        } else { // now Abu Simbel runs!
+    		//if ((Z80Ops::is48) && (Config::Issue2)) // Issue 2 behaviour only on Spectrum 48K
+				if (last_fe_write & 0x18) res |= 0x40;
+			//else
+			//	if (port254 & 0x10) data |= 0x40;
+		}
+#if 0
+		if (tape.playing)
+		{
+			// Bit 6 = EAR desde cinta
+			bool ear = get_current_ear_level_from_tape();
+			if (ear) res |= 0x40; else res &= 0xbf;
+			current_speaker_level = (ear) ? 1 : 0;
+
+		} else {
+			if (last_fe_write & 0x18) 
+				res = res | 0x40; 
+			else 
+				res &= 0xbf;
+		}
+
+  #endif
         
-    }
+    } else if ((port&0xff) == 0x1f ) // Joystick Kempston
+	{
+		return 0xff;
+	}
 
     return res;
 }
@@ -1221,6 +1257,7 @@ uint8_t port_in(z80* z, uint16_t port) {
 
 void port_out(z80* z, uint16_t port, uint8_t val) {
     (void)z;
+	//printf("out %d=%d", port, val);
     if ((port & 1) == 0) {
         border_color   = val & 0x07;
         last_fe_write  = val;
@@ -1550,7 +1587,7 @@ int main(int argc, char** argv) {
         cycles_done = 0; 
         last_audio_tstates = 0;
 
-        //SDL_Delay(15);
+        SDL_Delay(10);
     }
 
     SDL_DestroyTexture(texture);
