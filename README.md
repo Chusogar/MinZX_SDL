@@ -5,7 +5,7 @@ This repository contains two implementations:
 - **C version** (`minzx.c`) - Standalone C implementation with jgz80 CPU core
 - **C++ version** (`src/`) - Visual Studio project with z80cpp core
 
-The C version now includes complete TR-DOS disk support.
+The C version now includes **both ZX Spectrum 128K support and complete TR-DOS disk support**.
 
 Using a simple jgz80 Z80 emulator core (based on concepts from [z80cpp](https://github.com/jsanchezv/z80cpp) by José Luis Sánchez).
 
@@ -13,7 +13,10 @@ Using a simple jgz80 Z80 emulator core (based on concepts from [z80cpp](https://
 
 ### Working Features:
 
-- Boot into Spectrum Basic
+- **ZX Spectrum 48K and 128K emulation**
+- 128K memory banking (8 RAM banks of 16KB each)
+- ROM banking (2 ROM banks for 128K mode)
+- Boot into Spectrum Basic (48K or 128K mode)
 - Load SNA files from command line
 - Load TAP files (tape emulation with proper timing)
 - Load TZX files (advanced tape format with multiple block types)
@@ -22,6 +25,8 @@ Using a simple jgz80 Z80 emulator core (based on concepts from [z80cpp](https://
 - Keyboard input
 - Audio/beeper emulation
 - Video with proper border, BRIGHT attribute support
+- AY-3-8912 sound chip (placeholder)
+- Floating bus emulation support
 
 ### TR-DOS Disk Support
 
@@ -29,6 +34,19 @@ The emulator now supports TR-DOS disk images in two formats:
 
 - **.TRD** - Standard TR-DOS disk image format (read/write support)
 - **.SCL** - Sinclair Computer Language archive format (read-only)
+
+TR-DOS works in both 48K and 128K modes!
+
+### 128K Emulation
+
+- Memory banking: 8 RAM banks of 16KB each (total 128KB)
+- ROM banking: 2 ROM banks of 16KB each (48K BASIC + 128K editor)
+- Port 0x7FFD: Memory paging control
+  - Bits 0-2: RAM bank at 0xC000-0xFFFF
+  - Bit 3: Video page select (not implemented yet)
+  - Bit 4: ROM select (0 = 48K, 1 = 128K)
+  - Bit 5: Paging disable (locks configuration)
+- AY-3-8912 sound chip emulation (placeholder)
 
 #### FDC Emulation
 
@@ -55,15 +73,22 @@ Open `MinZX_SDL.sln` and build (Note: C++ version in `src/` directory)
 
 ## Usage
 
-### Basic Usage
+### Basic Usage (48K Mode - Default)
 ```bash
-./minzx                          # Boot to BASIC
-./minzx game.sna                 # Load snapshot
-./minzx tape.tap                 # Load tape
-./minzx tape.tzx                 # Load TZX tape
+./minzx                          # Boot to BASIC (48K)
+./minzx game.sna                 # Load snapshot (48K)
+./minzx tape.tap                 # Load tape (48K)
+./minzx tape.tzx                 # Load TZX tape (48K)
 ```
 
-### TR-DOS Disk Usage
+### 128K Mode
+```bash
+./minzx --128k                   # Boot to 128K BASIC
+./minzx --128k game.sna          # Load snapshot in 128K mode
+./minzx --128k tape.tap          # Load tape in 128K mode
+```
+
+### TR-DOS Disk Usage (48K Mode)
 ```bash
 # Mount a single TRD image to drive A:
 ./minzx disk.trd
@@ -84,6 +109,15 @@ Open `MinZX_SDL.sln` and build (Note: C++ version in `src/` directory)
 ./minzx disk.trd --trdos-rom trdos.rom
 
 # TR-DOS ROM is loaded automatically if trdos.rom exists in the current directory
+```
+
+### TR-DOS with 128K Mode
+```bash
+# Combine 128K and TR-DOS
+./minzx --128k disk.trd --trdos-rom trdos.rom
+
+# 128K with multiple disks
+./minzx --128k disk1.trd disk2.scl --drive-count 4
 ```
 
 ### Keyboard Shortcuts
@@ -156,6 +190,32 @@ You can create TRD images using tools like:
 - Runtime disk mounting/unmounting not implemented (restart to change disks)
 - No disk creation from within emulator
 - TR-DOS ROM switching is automatic based on PC address (0x3D00-0x3DFF range)
+- 128K video page selection not yet implemented
+- AY-3-8912 sound chip is placeholder only (no actual sound generation)
+- Floating bus logic added but not fully implemented
+
+## Combining 128K and TR-DOS
+
+The emulator supports using TR-DOS with the ZX Spectrum 128K. This allows you to:
+
+1. **Use 128K RAM** with disk operations
+2. **Run 128K programs** that also access disk files
+3. **Take advantage of both systems** simultaneously
+
+The TR-DOS ROM takes priority when accessed (PC in 0x3D00-0x3DFF range), regardless of whether you're in 48K or 128K mode.
+
+### Example: 128K + TR-DOS workflow
+
+```bash
+# Start in 128K mode with disk support
+./minzx --128k mydisk.trd --trdos-rom trdos.rom
+
+# The system has:
+# - 128KB of RAM with banking
+# - TR-DOS disk access
+# - Both 48K and 128K ROMs available
+# - Automatic ROM switching when needed
+```
 
 ## Testing
 
