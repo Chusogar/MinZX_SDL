@@ -49,8 +49,16 @@ scl_image_t* scl_open(const char* filename) {
     }
     
     // Create temporary TRD file to hold converted data
+    // Use portable temp file creation
     char temp_filename[512];
+#ifdef _WIN32
+    char* tmpdir = getenv("TEMP");
+    if (!tmpdir) tmpdir = getenv("TMP");
+    if (!tmpdir) tmpdir = ".";
+    snprintf(temp_filename, sizeof(temp_filename), "%s\\scl_temp_%p.trd", tmpdir, (void*)f);
+#else
     snprintf(temp_filename, sizeof(temp_filename), "/tmp/scl_temp_%p.trd", (void*)f);
+#endif
     
     FILE* trd_f = fopen(temp_filename, "wb+");
     if (!trd_f) {
@@ -73,6 +81,10 @@ scl_image_t* scl_open(const char* filename) {
     long catalog_pos = 0;
     fseek(trd_f, catalog_pos, SEEK_SET);
     
+    // Track allocation for files - local to this function
+    int next_track = 1;
+    int next_sector = 0;
+    
     for (int i = 0; i < header.files_count && i < 128; i++) {
         trd_file_entry_t entry;
         memcpy(entry.filename, descriptors[i].filename, 8);
@@ -82,9 +94,6 @@ scl_image_t* scl_open(const char* filename) {
         entry.sectors_used = descriptors[i].sectors_used;
         
         // Allocate space for file starting from track 1
-        static int next_track = 1;
-        static int next_sector = 0;
-        
         entry.start_track = next_track;
         entry.start_sector = next_sector;
         
@@ -105,7 +114,8 @@ scl_image_t* scl_open(const char* filename) {
     disk_info.files_count = header.files_count;
     disk_info.free_sectors = 2544; // Placeholder
     disk_info.tr_dos_id = 0x10;
-    strcpy((char*)disk_info.disk_label, "SCLCONV");
+    strncpy((char*)disk_info.disk_label, "SCLCONV", 8);
+    // Ensure no buffer overflow
     
     long info_pos = 8 * TRD_SECTOR_SIZE; // Sector 8 on track 0
     fseek(trd_f, info_pos, SEEK_SET);

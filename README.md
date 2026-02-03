@@ -1,7 +1,7 @@
 # MinZX_SDL
 A minimal ZX Spectrum emulator, written in C, using SDL.
 
-Using [jgz80 emulator core](https://github.com/jsanchezv/z80cpp) - simple C implementation for ZX Spectrum.
+Using a simple jgz80 Z80 emulator core (based on concepts from [z80cpp](https://github.com/jsanchezv/z80cpp) by José Luis Sánchez).
 
 ## Features
 

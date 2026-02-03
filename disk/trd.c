@@ -58,8 +58,10 @@ trd_image_t* trd_open(const char* filename, bool read_only) {
         img->tracks = 80;
         img->sides = 2;
     } else if (size == 327680) {
-        // Could be 40 tracks DS or 80 tracks SS - check disk info
-        img->tracks = 80; // Assume 80 tracks DS for now
+        // Could be 40 tracks DS or 80 tracks SS
+        // Default to 80 tracks DS - will be corrected from disk_info if needed
+        // Note: 40 tracks DS is less common in practice
+        img->tracks = 80;
         img->sides = 2;
     } else {
         fprintf(stderr, "TRD: Unknown disk size %ld bytes\n", size);

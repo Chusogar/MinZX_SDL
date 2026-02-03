@@ -115,7 +115,7 @@ static void fdc_execute_command(fdc_t* fdc, uint8_t cmd) {
                     break;
                 }
                 
-                // Sector numbers in TR-DOS are 1-based, but we use 0-based internally
+                // TR-DOS uses 1-based sector numbers, convert to 0-based for internal use
                 uint8_t sector_num = (fdc->sector > 0) ? (fdc->sector - 1) : 0;
                 
                 if (trd_read_sector(img, fdc->track, fdc->current_side, sector_num, fdc->sector_buffer)) {

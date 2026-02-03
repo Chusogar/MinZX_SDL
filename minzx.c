@@ -1571,7 +1571,7 @@ int main(int argc, char** argv) {
             if (drive_count < 1 || drive_count > 4) drive_count = 2;
         } else if (strcmp(argv[i], "--trdos-rom") == 0 && i + 1 < argc) {
             // TR-DOS ROM loading not implemented yet
-            printf("Note: --trdos-rom option not yet implemented\n");
+            fprintf(stderr, "Warning: --trdos-rom option not yet implemented\n");
             i++;
         }
     }
