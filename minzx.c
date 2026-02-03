@@ -1,5 +1,5 @@
 /*
- * ZX Spectrum 48K Emulator con SDL2 + JGZ80
+ * ZX Spectrum 48K/128K Emulator con SDL2 + JGZ80
  * - Carga .TAP por pulsos (pilot/sync/data) compatible ROM
  * - Carga .TZX por pulsos:
  *   - Soportados: 0x00(=0x10), 0x02(=0x12), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
@@ -11,9 +11,21 @@
  * - Puerto FE: bit 6 = EAR (tape); bit 7 = espejo de bit 3 del último OUT
  * - Beeper/speaker por eventos con timestamp (T-states) → audio estable
  *
+ * 128K Support:
+ * - Memory banking: 8 RAM banks of 16KB each (total 128KB)
+ * - ROM banking: 2 ROM banks of 16KB each (48K BASIC + 128K editor)
+ * - Port 0x7FFD: Memory paging control
+ *   - Bits 0-2: RAM bank at 0xC000-0xFFFF
+ *   - Bit 3: Video page select (not implemented)
+ *   - Bit 4: ROM select (0 = 48K, 1 = 128K)
+ *   - Bit 5: Paging disable (locks configuration)
+ * - AY-3-8912 sound chip (placeholder):
+ *   - Port 0xFFFD: Register select
+ *   - Port 0xBFFD: Data write/read
+ *
  * Compilar LINUX:     gcc minzx.c jgz80/z80.c -o minzx -lSDL2 -lm
  * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
- * Uso: ./minzx [cinta.tap | cinta.tzx | snapshot.sna]
+ * Uso: ./minzx [--128k] [cinta.tap | cinta.tzx | snapshot.sna]
  */
 
 #include <SDL2/SDL.h>
@@ -1342,17 +1354,31 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
     // 128K memory paging (port 0x7FFD)
     if (is_128k_mode && (port & 0xC002) == 0x4000) {  // Port 0x7FFD
         if (!paging_disabled) {
+            uint8_t old_port_7ffd = port_7ffd;
             port_7ffd = val;
             
             // Bit 5: If set, disable further paging (until reset)
             if (val & 0x20) {
                 paging_disabled = 1;
+                printf("[128K] Paging locked by port 0x7FFD write: 0x%02X\n", val);
+            }
+            
+            // Debug logging for bank switches
+            if ((old_port_7ffd & 0x07) != (val & 0x07)) {
+                printf("[128K] RAM bank at 0xC000 switched from %d to %d\n", 
+                       old_port_7ffd & 0x07, val & 0x07);
+            }
+            if ((old_port_7ffd & 0x10) != (val & 0x10)) {
+                printf("[128K] ROM bank switched to %s\n", 
+                       (val & 0x10) ? "ROM 1 (128K editor)" : "ROM 0 (48K BASIC)");
             }
             
             // Bits 0-2: RAM page at 0xC000-0xFFFF
             // Bit 3: Video page (0 = bank 5, 1 = bank 7) - not implemented yet
             // Bit 4: ROM select (0 = 48K ROM, 1 = 128K ROM)
             // Bit 5: Paging disable
+        } else {
+            printf("[128K] Paging write ignored (locked): port=0x%04X val=0x%02X\n", port, val);
         }
     }
     
@@ -1360,12 +1386,14 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
     // Port 0xFFFD: Register select
     if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
         ay_register_selected = val & 0x0F;  // Only 16 registers
+        printf("[AY] Register selected: %d (port 0xFFFD)\n", ay_register_selected);
     }
     
     // Port 0xBFFD: Data write
     if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
         if (ay_register_selected < 16) {
             ay_registers[ay_register_selected] = val;
+            printf("[AY] Register %d = 0x%02X (port 0xBFFD)\n", ay_register_selected, val);
             // Placeholder: Actual AY-3-8912 sound generation would go here
         }
     }
@@ -1689,6 +1717,17 @@ int main(int argc, char** argv) {
     cpu.sp = 0x0000;
     cpu.interrupt_mode = 1;
 
+    // Initialize RAM banks in 128K mode
+    if (is_128k_mode) {
+        // Clear all RAM banks
+        for (int i = 0; i < RAM_BANKS; i++) {
+            memset(ram_banks[i], 0, RAM_BANK_SIZE);
+        }
+        // Initialize paging: Bank 0 at 0xC000, ROM 0 selected
+        port_7ffd = 0x00;
+        paging_disabled = 0;
+        printf("128K RAM banks initialized\n");
+    }
 
     int frame_counter = 0;
     int flash_phase = 0;
