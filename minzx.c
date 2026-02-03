@@ -75,6 +75,11 @@ trd_image_t* disk_images[4] = {NULL, NULL, NULL, NULL};
 scl_image_t* scl_images[4] = {NULL, NULL, NULL, NULL};
 bool trdos_enabled = false;
 
+// TR-DOS ROM support
+uint8_t trdos_rom[ROM_SIZE];
+bool trdos_rom_loaded = false;
+bool trdos_rom_active = false;  // true when TR-DOS ROM is mapped
+
 // Configuración de audio
 SDL_AudioDeviceID audio_dev;
 SDL_AudioSpec want;
@@ -1184,6 +1189,12 @@ uint8_t read_byte(void* ud, uint16_t addr) {
     }
 #endif
     (void)ud;
+    
+    // If TR-DOS ROM is active and address is in ROM area, read from TR-DOS ROM
+    if (trdos_rom_active && addr < ROM_SIZE && trdos_rom_loaded) {
+        return trdos_rom[addr];
+    }
+    
     return memory[addr];
 }
 
@@ -1312,6 +1323,19 @@ bool load_rom(const char* fn) {
     return rd == ROM_SIZE;
 }
 
+bool load_trdos_rom(const char* fn) {
+    FILE* f = fopen(fn, "rb");
+    if (!f) return false;
+    size_t rd = fread(trdos_rom, 1, ROM_SIZE, f);
+    fclose(f);
+    if (rd == ROM_SIZE) {
+        trdos_rom_loaded = true;
+        printf("TR-DOS ROM loaded: %s\n", fn);
+        return true;
+    }
+    return false;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Vídeo
 // ─────────────────────────────────────────────────────────────
@@ -1418,6 +1442,16 @@ void handle_input() {
                 }
             } else {
                 printf("TR-DOS not enabled\n");
+            }
+        }
+        
+        // F9: Toggle TR-DOS ROM
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F9) {
+            if (trdos_rom_loaded) {
+                trdos_rom_active = !trdos_rom_active;
+                printf("TR-DOS ROM: %s\n", trdos_rom_active ? "ACTIVE" : "INACTIVE");
+            } else {
+                printf("TR-DOS ROM not loaded\n");
             }
         }
 
@@ -1561,6 +1595,7 @@ int main(int argc, char** argv) {
     bool read_only_disks = false;
     int drive_count = 2; // Default 2 drives
     int next_drive = 0;
+    const char* trdos_rom_file = NULL;
     
     // Parse command-line arguments
     for (int i = 1; i < argc; i++) {
@@ -1570,9 +1605,7 @@ int main(int argc, char** argv) {
             drive_count = atoi(argv[++i]);
             if (drive_count < 1 || drive_count > 4) drive_count = 2;
         } else if (strcmp(argv[i], "--trdos-rom") == 0 && i + 1 < argc) {
-            // TR-DOS ROM loading not implemented yet
-            fprintf(stderr, "Warning: --trdos-rom option not yet implemented\n");
-            i++;
+            trdos_rom_file = argv[++i];
         }
     }
     
@@ -1607,6 +1640,16 @@ int main(int argc, char** argv) {
                                 SDL_TEXTUREACCESS_STATIC, FULL_WIDTH, FULL_HEIGHT);
 
     if (!load_rom("zx48.rom")) { fprintf(stderr, "No se encuentra zx48.rom\n"); return 1; }
+
+    // Try to load TR-DOS ROM if specified or if trdos.rom exists
+    if (trdos_rom_file) {
+        if (!load_trdos_rom(trdos_rom_file)) {
+            fprintf(stderr, "Warning: Could not load TR-DOS ROM: %s\n", trdos_rom_file);
+        }
+    } else {
+        // Try to load trdos.rom from current directory by default
+        load_trdos_rom("trdos.rom");
+    }
 
     z80_init(&cpu);
     cpu.read_byte  = read_byte;

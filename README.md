@@ -79,6 +79,11 @@ Open `MinZX_SDL.sln` and build (Note: C++ version in `src/` directory)
 
 # Specify number of drives (1-4, default 2)
 ./minzx disk.trd --drive-count 4
+
+# Load TR-DOS ROM explicitly
+./minzx disk.trd --trdos-rom trdos.rom
+
+# TR-DOS ROM is loaded automatically if trdos.rom exists in the current directory
 ```
 
 ### Keyboard Shortcuts
@@ -87,16 +92,33 @@ Open `MinZX_SDL.sln` and build (Note: C++ version in `src/` directory)
 - **F6** - Reload current tape
 - **F7** - Play/pause tape
 - **F8** - List mounted disks and show directory
+- **F9** - Toggle TR-DOS ROM on/off (when loaded)
 - **F12** - Reset (CPU reset)
 
 ### TR-DOS ROM
 
-To use TR-DOS functionality, you'll need a TR-DOS ROM. The emulator currently boots with the standard ZX Spectrum 48K ROM. To use disk operations:
+The emulator can load a TR-DOS ROM to enable full TR-DOS functionality:
 
-1. Obtain a TR-DOS ROM (trdos.rom) - these are available from various ZX Spectrum resource sites
-2. (Future) Use `--trdos-rom trdos.rom` to load it (not yet implemented)
+1. **Automatic loading**: Place a file named `trdos.rom` in the same directory as the emulator. It will be loaded automatically when disk images are used.
 
-For now, disk images can be accessed via BASIC commands if a TR-DOS aware program is loaded.
+2. **Manual loading**: Use the `--trdos-rom` option:
+   ```bash
+   ./minzx disk.trd --trdos-rom /path/to/trdos.rom
+   ```
+
+3. **Toggle ROM**: Press **F9** to switch between the ZX Spectrum ROM and TR-DOS ROM during emulation. This allows you to:
+   - Boot into ZX Spectrum BASIC (ZX ROM active)
+   - Switch to TR-DOS (TR-DOS ROM active) to access disk commands
+   - Switch back to ZX ROM to run BASIC programs
+
+#### Where to get TR-DOS ROM
+
+TR-DOS ROMs are available from various ZX Spectrum resource sites. Common versions include:
+- TR-DOS 5.03 (most compatible)
+- TR-DOS 5.04T
+- TR-DOS 6.10
+
+**Note**: The TR-DOS ROM file should be exactly 16384 bytes (16KB).
 
 ## Disk Image Formats
 
@@ -123,24 +145,49 @@ You can create TRD images using tools like:
 ## Known Limitations
 
 - SCL images are read-only (write support would require re-packing to SCL format)
-- TR-DOS ROM loading not yet implemented (--trdos-rom option reserved)
 - Runtime disk mounting/unmounting not implemented (restart to change disks)
 - No disk creation from within emulator
+- TR-DOS ROM must be toggled manually with F9 key (automatic detection not implemented)
 
 ## Testing
 
 To test disk support:
 
 1. Create or obtain a .TRD disk image
-2. Run: `./minzx test.trd`
-3. Press F8 to see disk catalog
-4. If you have TR-DOS ROM loaded or a TR-DOS aware program, you can access files
+2. Obtain a TR-DOS ROM (trdos.rom) - place it in the same directory as minzx
+3. Run: `./minzx test.trd`
+4. The TR-DOS ROM will be loaded automatically
+5. Press F9 to activate TR-DOS ROM
+6. Press F8 to see disk catalog
 
-Example with TR-DOS commands (if TR-DOS ROM is active):
+### Using TR-DOS
+
+Once TR-DOS ROM is active (press F9):
+
 ```
-RANDOMIZE USR 15616  (enters TR-DOS)
-CAT                   (lists directory)
-RUN "filename"        (runs BASIC program from disk)
+The system will boot into TR-DOS. Common TR-DOS commands:
+
+LIST       - List files in the directory
+RUN "file" - Run a BASIC program from disk  
+LOAD "file" - Load a file
+SAVE "file" - Save a file
+CAT        - Show disk catalog
+```
+
+To return to ZX Spectrum BASIC, press F9 again to deactivate TR-DOS ROM and reset (F12).
+
+### Example Session
+
+```bash
+# Start with a disk image and TR-DOS ROM in current directory
+./minzx game.trd
+
+# In console:
+# - TR-DOS ROM will load automatically if trdos.rom exists
+# - Press F9 to activate TR-DOS
+# - System boots into TR-DOS
+# - Use LIST or CAT to see files
+# - Use RUN "filename" to load programs
 ```
 
 ## License
