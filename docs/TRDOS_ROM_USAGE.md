@@ -28,22 +28,21 @@ Opción B: Especifica la ruta con `--trdos-rom`
 ./minzx disco1.trd disco2.scl --trdos-rom trdos.rom
 ```
 
-### 4. Usar TR-DOS
+### 4. Usar TR-DOS - AUTOMÁTICO
+
+**¡IMPORTANTE!** La ROM TR-DOS se activa automáticamente cuando es necesario:
 
 1. **Iniciar**: El emulador arranca con ROM ZX Spectrum
-2. **Activar TR-DOS**: Presiona `F9` para cambiar a ROM TR-DOS
-3. **Usar comandos**: Ahora puedes usar comandos TR-DOS:
-   - `LIST` - Listar archivos
-   - `RUN "nombre"` - Ejecutar programa BASIC
-   - `LOAD "nombre"` - Cargar archivo
-   - `CAT` - Mostrar catálogo
+2. **Uso normal**: Escribe comandos BASIC normales
+3. **Activación automática**: Cuando ejecutas comandos que acceden al disco (CAT, LOAD, RUN, etc.), la ROM TR-DOS se activa automáticamente
+4. **Desactivación automática**: Cuando termina la operación de disco, vuelve a ROM ZX Spectrum
 
-4. **Volver a ZX ROM**: Presiona `F9` nuevamente
+**No necesitas presionar F9** - el sistema detecta automáticamente cuando se llama a TR-DOS.
 
 ### 5. Teclas útiles
 
-- `F9` - Alternar ROM TR-DOS ON/OFF
 - `F8` - Listar discos montados y archivos
+- `F9` - Toggle manual ROM (solo para debugging - normalmente no necesario)
 - `F12` - Reset del sistema
 - `ESC` - Salir
 
@@ -59,13 +58,23 @@ $ ./minzx juegos.trd
 # TR-DOS ROM loaded: trdos.rom
 
 # En el emulador:
-# 1. Presionar F9 -> "TR-DOS ROM: ACTIVE"
-# 2. El sistema arranca en TR-DOS
-# 3. Escribir: LIST
-# 4. Ver lista de archivos del disco
+# 1. Sistema arranca en ZX Spectrum BASIC
+# 2. Escribir: CAT
+# 3. ROM TR-DOS se activa AUTOMÁTICAMENTE
+# 4. Se muestra el catálogo del disco
 # 5. Escribir: RUN "JUEGO"
 # 6. El juego se carga desde el disco
+# 7. ROM vuelve a ZX Spectrum automáticamente
 ```
+
+## Cómo funciona la activación automática
+
+El emulador monitorea el Program Counter (PC) del Z80:
+
+- **Activación**: Cuando `PC & 0xFF00 == 0x3D00` (rango 0x3D00-0x3DFF)
+- **Desactivación**: Cuando PC sale de ese rango
+
+Este rango de direcciones (0x3D00-0x3DFF) es el punto de entrada estándar de TR-DOS en sistemas ZX Spectrum. Cuando cualquier programa llama a TR-DOS (mediante RANDOMIZE USR 15616 o llamadas del sistema), el PC entra en este rango y la ROM se activa automáticamente.
 
 ## Solución de problemas
 
@@ -79,12 +88,19 @@ $ ./minzx juegos.trd
 
 **No puedo ver archivos en disco**
 - Presiona F8 para ver si el disco está montado
-- Presiona F9 para activar ROM TR-DOS
 - Verifica que el archivo .trd es válido
+- La ROM TR-DOS debería activarse automáticamente al usar comandos de disco
+
+**La ROM no se activa automáticamente**
+- Verifica que trdos.rom se cargó correctamente
+- Los programas deben llamar a TR-DOS mediante el punto de entrada estándar (0x3D00)
+- Usa F9 para toggle manual si es necesario (debugging)
 
 ## Notas técnicas
 
 - La ROM TR-DOS se mapea en 0x0000-0x3FFF cuando está activa
-- La conmutación es manual con F9 (no automática)
+- La activación es automática basada en el valor del PC (Program Counter)
+- Condición: `(PC & 0xFF00) == 0x3D00`
 - Ambas ROMs (ZX48 y TR-DOS) se mantienen en memoria
 - El cambio es instantáneo y no afecta la RAM
+- F9 permite override manual (útil para debugging)

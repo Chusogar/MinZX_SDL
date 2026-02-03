@@ -1190,6 +1190,15 @@ uint8_t read_byte(void* ud, uint16_t addr) {
 #endif
     (void)ud;
     
+    // Automatic TR-DOS ROM activation when PC is in 0x3D00-0x3DFF range
+    if (trdos_rom_loaded) {
+        if ((cpu.pc & 0xFF00) == 0x3D00) {
+            trdos_rom_active = true;
+        } else if ((cpu.pc & 0xFF00) != 0x3D00 && trdos_rom_active) {
+            trdos_rom_active = false;
+        }
+    }
+    
     // If TR-DOS ROM is active and address is in ROM area, read from TR-DOS ROM
     if (trdos_rom_active && addr < ROM_SIZE && trdos_rom_loaded) {
         return trdos_rom[addr];
@@ -1445,11 +1454,12 @@ void handle_input() {
             }
         }
         
-        // F9: Toggle TR-DOS ROM
+        // F9: Toggle TR-DOS ROM (manual override)
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F9) {
             if (trdos_rom_loaded) {
                 trdos_rom_active = !trdos_rom_active;
-                printf("TR-DOS ROM: %s\n", trdos_rom_active ? "ACTIVE" : "INACTIVE");
+                printf("TR-DOS ROM: %s (manual override)\n", trdos_rom_active ? "ACTIVE" : "INACTIVE");
+                printf("Note: ROM auto-switches when PC is in 0x3D00-0x3DFF range\n");
             } else {
                 printf("TR-DOS ROM not loaded\n");
             }

@@ -92,7 +92,7 @@ Open `MinZX_SDL.sln` and build (Note: C++ version in `src/` directory)
 - **F6** - Reload current tape
 - **F7** - Play/pause tape
 - **F8** - List mounted disks and show directory
-- **F9** - Toggle TR-DOS ROM on/off (when loaded)
+- **F9** - Manual TR-DOS ROM toggle (optional - ROM auto-switches based on PC)
 - **F12** - Reset (CPU reset)
 
 ### TR-DOS ROM
@@ -106,10 +106,18 @@ The emulator can load a TR-DOS ROM to enable full TR-DOS functionality:
    ./minzx disk.trd --trdos-rom /path/to/trdos.rom
    ```
 
-3. **Toggle ROM**: Press **F9** to switch between the ZX Spectrum ROM and TR-DOS ROM during emulation. This allows you to:
-   - Boot into ZX Spectrum BASIC (ZX ROM active)
-   - Switch to TR-DOS (TR-DOS ROM active) to access disk commands
-   - Switch back to ZX ROM to run BASIC programs
+3. **Automatic ROM switching**: The emulator automatically activates TR-DOS ROM when the program counter (PC) enters the TR-DOS entry point range (0x3D00-0x3DFF). This happens automatically when:
+   - TR-DOS routines are called from BASIC or machine code
+   - The system boots into TR-DOS
+   - Disk operations are performed
+
+4. **Manual toggle** (optional): Press **F9** to manually override the automatic switching. This is mainly for debugging purposes.
+
+#### How it works
+
+- **Automatic activation**: When `PC & 0xFF00 == 0x3D00`, TR-DOS ROM is mapped
+- **Automatic deactivation**: When PC leaves the 0x3D00-0x3DFF range, ZX Spectrum ROM is restored
+- **Seamless switching**: The change happens transparently during execution
 
 #### Where to get TR-DOS ROM
 
@@ -147,7 +155,7 @@ You can create TRD images using tools like:
 - SCL images are read-only (write support would require re-packing to SCL format)
 - Runtime disk mounting/unmounting not implemented (restart to change disks)
 - No disk creation from within emulator
-- TR-DOS ROM must be toggled manually with F9 key (automatic detection not implemented)
+- TR-DOS ROM switching is automatic based on PC address (0x3D00-0x3DFF range)
 
 ## Testing
 
@@ -157,24 +165,20 @@ To test disk support:
 2. Obtain a TR-DOS ROM (trdos.rom) - place it in the same directory as minzx
 3. Run: `./minzx test.trd`
 4. The TR-DOS ROM will be loaded automatically
-5. Press F9 to activate TR-DOS ROM
+5. TR-DOS ROM will activate automatically when the system calls TR-DOS routines (PC in 0x3D00-0x3DFF)
 6. Press F8 to see disk catalog
 
 ### Using TR-DOS
 
-Once TR-DOS ROM is active (press F9):
+The TR-DOS ROM activates automatically when needed. Typical workflow:
 
-```
-The system will boot into TR-DOS. Common TR-DOS commands:
+1. Start the emulator with a disk image: `./minzx game.trd`
+2. The system boots into ZX Spectrum BASIC
+3. Use BASIC commands that access disk (e.g., `LOAD`, `CAT`, `RUN`)
+4. When TR-DOS routines are called (PC enters 0x3D00-0x3DFF), the ROM automatically switches
+5. After TR-DOS operations complete, the ROM switches back to ZX Spectrum
 
-LIST       - List files in the directory
-RUN "file" - Run a BASIC program from disk  
-LOAD "file" - Load a file
-SAVE "file" - Save a file
-CAT        - Show disk catalog
-```
-
-To return to ZX Spectrum BASIC, press F9 again to deactivate TR-DOS ROM and reset (F12).
+**Note**: The ROM switching is fully automatic based on the program counter. You don't need to manually toggle ROMs.
 
 ### Example Session
 
@@ -182,12 +186,13 @@ To return to ZX Spectrum BASIC, press F9 again to deactivate TR-DOS ROM and rese
 # Start with a disk image and TR-DOS ROM in current directory
 ./minzx game.trd
 
-# In console:
-# - TR-DOS ROM will load automatically if trdos.rom exists
-# - Press F9 to activate TR-DOS
-# - System boots into TR-DOS
-# - Use LIST or CAT to see files
-# - Use RUN "filename" to load programs
+# System boots into ZX Spectrum BASIC
+# Type in BASIC:
+CAT        # TR-DOS ROM activates automatically, shows disk catalog
+RUN "game" # Loads and runs game from disk
+
+# ROM switching happens transparently
+# F9 can be used for manual override if needed (debugging)
 ```
 
 ## License
