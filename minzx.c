@@ -92,6 +92,19 @@ uint8_t keyboard[8]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 int      cycles_done   = 0;     // puede replegarse por frame
 uint64_t global_cycles = 0;     // SIEMPRE crece → referencia para cinta/audio
 
+// Floating bus support - scanline and ULA fetch tracking
+#define TOTAL_SCANLINES      312
+#define TOP_BORDER_LINES     64
+#define VISIBLE_LINES        192
+#define TSTATES_PER_SCANLINE 224
+#define TSTATES_ACTIVE_FETCH 128
+
+int      current_scanline = 0;       // 0..311
+uint32_t tstates_this_line = 0;
+int      ula_fetch_phase = -1;       // -1 = idle, 0..15 = slot activo
+bool     is_in_visible_area = false;
+uint16_t current_video_address = 0;
+
 // Configuración de audio
 SDL_AudioDeviceID audio_dev;
 SDL_AudioSpec want;
@@ -1263,6 +1276,64 @@ void write_byte(void* ud, uint16_t addr, uint8_t val) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Floating Bus - ULA fetch state tracking
+// ─────────────────────────────────────────────────────────────
+void update_ula_fetch_state() {
+    // Calculate T-states within current scanline
+    uint32_t t_in_line = cycles_done % TSTATES_PER_SCANLINE;
+    
+    // Check if we're in the visible area (scanlines 64-255)
+    if (current_scanline < TOP_BORDER_LINES || 
+        current_scanline >= TOP_BORDER_LINES + VISIBLE_LINES) {
+        is_in_visible_area = false;
+        ula_fetch_phase = -1;
+        current_video_address = 0;
+        return;
+    }
+    
+    is_in_visible_area = true;
+    
+    // Check if we're past the active fetch period (128 T-states)
+    if (t_in_line >= TSTATES_ACTIVE_FETCH) {
+        ula_fetch_phase = -1;
+        current_video_address = 0;
+        return;
+    }
+    
+    // Calculate fetch slot (0-15) and sub-T-state within slot (0-7)
+    int slot = t_in_line / 8;
+    int sub_t = t_in_line % 8;
+    
+    // ULA only fetches during first 4 T-states of each 8 T-state slot
+    if (sub_t >= 4) {
+        ula_fetch_phase = -1;
+        current_video_address = 0;
+        return;
+    }
+    
+    ula_fetch_phase = slot;
+    
+    // Calculate which character column (0-31) and whether we're fetching attribute
+    int char_x = slot * 2 + (sub_t / 2);
+    bool is_attr = (sub_t % 2) == 1;
+    
+    // Calculate Y coordinate in visible area (0-191)
+    int spe_y = current_scanline - TOP_BORDER_LINES;
+    
+    // Calculate ULA's Y coordinate (with line interleaving)
+    // Y = bits 7-6 | bits 2-0 | bits 5-3
+    int ula_y = ((spe_y & 0xC0) | ((spe_y & 0x38) >> 3) | ((spe_y & 0x07) << 3));
+    
+    if (is_attr) {
+        // Attribute: 0x5800 + (Y/8)*32 + X
+        current_video_address = 0x5800 + ((spe_y >> 3) << 5) + char_x;
+    } else {
+        // Pixel data: 0x4000 + ULA_Y*32 + X
+        current_video_address = 0x4000 + (ula_y << 5) + char_x;
+    }
+}
+
 uint8_t port_in(z80* z, uint16_t port) {
     (void)z;
     uint8_t res = 0xFF;
@@ -1328,6 +1399,21 @@ uint8_t port_in(z80* z, uint16_t port) {
     if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
         if (ay_register_selected < 16) {
             return ay_registers[ay_register_selected];
+        }
+    }
+    
+    // Floating bus para puertos no decodificados (excepto Kempston)
+    // Solo aplica si no es el puerto Kempston (0x1F)
+    if ((port & 0xFF) != 0x1F) {
+        update_ula_fetch_state();
+        
+        if (is_in_visible_area && ula_fetch_phase >= 0) {
+            // Return the video memory byte that ULA is currently fetching
+            if (is_128k_mode) {
+                return read_byte(NULL, current_video_address);
+            } else {
+                return memory[current_video_address];
+            }
         }
     }
 
@@ -1778,12 +1864,19 @@ int main(int argc, char** argv) {
     while (true) {
         handle_input();
         
+        // Reset scanline counter at start of frame
+        current_scanline = 0;
+        
         for (int line = 0; line < FULL_HEIGHT; line++) {
+            current_scanline = line;
+            tstates_this_line = 0;
+            
             z80_step_n(&cpu, 224);
             displayscanline(line, flash_phase);
             
             cycles_done   += (224);
             global_cycles += (uint64_t)224;
+            tstates_this_line += 224;
             //generate_audio(cycles_done);
 
             if (line == (FULL_HEIGHT -1)) {z80_pulse_irq(&cpu, 1); /*generate_audio(69888);*/}
