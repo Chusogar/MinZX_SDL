@@ -44,11 +44,28 @@
 #define MEMORY_SIZE    (64*1024)
 #define CYCLES_PER_FRAME 69888
 
+// 128K Memory layout
+#define RAM_BANKS      8
+#define RAM_BANK_SIZE  16384
+#define ROM_BANKS      2
+#define TOTAL_RAM_SIZE (RAM_BANKS * RAM_BANK_SIZE)  // 128KB
+
 // ─────────────────────────────────────────────────────────────
 // Globals
 // ─────────────────────────────────────────────────────────────
 uint8_t memory[MEMORY_SIZE];
 z80 cpu;
+
+// 128K specific memory
+int is_128k_mode = 0;                          // 0 = 48K, 1 = 128K
+uint8_t ram_banks[RAM_BANKS][RAM_BANK_SIZE];  // 8 banks of 16KB each
+uint8_t rom_banks[ROM_BANKS][ROM_SIZE];       // 2 ROM banks of 16KB each
+uint8_t port_7ffd = 0x00;                      // Memory paging register
+int paging_disabled = 0;                       // Bit 5 of port 7FFD locks paging
+
+// AY-3-8912 sound chip (placeholder)
+uint8_t ay_register_selected = 0;
+uint8_t ay_registers[16] = {0};
 
 SDL_Window*   window   = NULL;
 SDL_Renderer* renderer = NULL;
@@ -1172,7 +1189,32 @@ uint8_t read_byte(void* ud, uint16_t addr) {
     }
 #endif
     (void)ud;
-    return memory[addr];
+    
+    if (!is_128k_mode) {
+        return memory[addr];
+    }
+    
+    // 128K memory mapping
+    // 0x0000-0x3FFF: ROM (bank selected by bit 4 of port 7FFD)
+    // 0x4000-0x7FFF: RAM bank 5 (fixed)
+    // 0x8000-0xBFFF: RAM bank 2 (fixed)
+    // 0xC000-0xFFFF: RAM bank (selected by bits 0-2 of port 7FFD)
+    
+    if (addr < 0x4000) {
+        // ROM area
+        int rom_bank = (port_7ffd & 0x10) >> 4;
+        return rom_banks[rom_bank][addr];
+    } else if (addr < 0x8000) {
+        // RAM bank 5 (fixed)
+        return ram_banks[5][addr - 0x4000];
+    } else if (addr < 0xC000) {
+        // RAM bank 2 (fixed)
+        return ram_banks[2][addr - 0x8000];
+    } else {
+        // Paged RAM bank
+        int bank = port_7ffd & 0x07;
+        return ram_banks[bank][addr - 0xC000];
+    }
 }
 
 void write_byte(void* ud, uint16_t addr, uint8_t val) {
@@ -1186,7 +1228,27 @@ void write_byte(void* ud, uint16_t addr, uint8_t val) {
     }
 #endif
     (void)ud;
-    if (addr >= RAM_START) memory[addr] = val;
+    
+    if (!is_128k_mode) {
+        if (addr >= RAM_START) memory[addr] = val;
+        return;
+    }
+    
+    // 128K memory mapping (ROM is read-only)
+    if (addr < 0x4000) {
+        // ROM area - ignore writes
+        return;
+    } else if (addr < 0x8000) {
+        // RAM bank 5 (fixed)
+        ram_banks[5][addr - 0x4000] = val;
+    } else if (addr < 0xC000) {
+        // RAM bank 2 (fixed)
+        ram_banks[2][addr - 0x8000] = val;
+    } else {
+        // Paged RAM bank
+        int bank = port_7ffd & 0x07;
+        ram_banks[bank][addr - 0xC000] = val;
+    }
 }
 
 uint8_t port_in(z80* z, uint16_t port) {
@@ -1249,6 +1311,13 @@ uint8_t port_in(z80* z, uint16_t port) {
 	{
 		return 0xff;
 	}
+    
+    // AY-3-8912 sound chip data read (port 0xFFFD in 128K mode)
+    if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
+        if (ay_register_selected < 16) {
+            return ay_registers[ay_register_selected];
+        }
+    }
 
     return res;
 }
@@ -1269,6 +1338,37 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         // El bit 4 controla el altavoz
         current_speaker_level = (val & 0x10) ? 1 : 0;
     }
+    
+    // 128K memory paging (port 0x7FFD)
+    if (is_128k_mode && (port & 0xC002) == 0x4000) {  // Port 0x7FFD
+        if (!paging_disabled) {
+            port_7ffd = val;
+            
+            // Bit 5: If set, disable further paging (until reset)
+            if (val & 0x20) {
+                paging_disabled = 1;
+            }
+            
+            // Bits 0-2: RAM page at 0xC000-0xFFFF
+            // Bit 3: Video page (0 = bank 5, 1 = bank 7) - not implemented yet
+            // Bit 4: ROM select (0 = 48K ROM, 1 = 128K ROM)
+            // Bit 5: Paging disable
+        }
+    }
+    
+    // AY-3-8912 sound chip registers (placeholder)
+    // Port 0xFFFD: Register select
+    if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
+        ay_register_selected = val & 0x0F;  // Only 16 registers
+    }
+    
+    // Port 0xBFFD: Data write
+    if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
+        if (ay_register_selected < 16) {
+            ay_registers[ay_register_selected] = val;
+            // Placeholder: Actual AY-3-8912 sound generation would go here
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1280,6 +1380,18 @@ bool load_rom(const char* fn) {
     size_t rd = fread(memory, 1, ROM_SIZE, f);
     fclose(f);
     return rd == ROM_SIZE;
+}
+
+bool load_128k_rom(const char* fn) {
+    FILE* f = fopen(fn, "rb");
+    if (!f) return false;
+    
+    // Load both 16KB ROM banks (total 32KB)
+    size_t rd0 = fread(rom_banks[0], 1, ROM_SIZE, f);
+    size_t rd1 = fread(rom_banks[1], 1, ROM_SIZE, f);
+    fclose(f);
+    
+    return (rd0 == ROM_SIZE && rd1 == ROM_SIZE);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1505,6 +1617,16 @@ bool load_tap(const char* filename) {
 // Main
 // ─────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+    // Parse command-line arguments
+    const char* tape_file = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--128k") == 0) {
+            is_128k_mode = 1;
+        } else {
+            tape_file = argv[i];
+        }
+    }
+    
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -1525,7 +1647,8 @@ int main(int argc, char** argv) {
         SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
 
-    window = SDL_CreateWindow("Minimal ZX 48K",
+    const char* window_title = is_128k_mode ? "Minimal ZX 128K" : "Minimal ZX 48K";
+    window = SDL_CreateWindow(window_title,
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               FULL_WIDTH * SCALE, FULL_HEIGHT * SCALE, 0);
 
@@ -1535,7 +1658,27 @@ int main(int argc, char** argv) {
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                 SDL_TEXTUREACCESS_STATIC, FULL_WIDTH, FULL_HEIGHT);
 
-    if (!load_rom("zx48.rom")) { fprintf(stderr, "No se encuentra zx48.rom\n"); return 1; }
+    // Load appropriate ROM
+    if (is_128k_mode) {
+        if (!load_128k_rom("zx128.rom")) { 
+            fprintf(stderr, "No se encuentra zx128.rom, intentando zx48.rom en 128K mode\n");
+            // Fallback: load 48K ROM into both banks
+            if (!load_rom("zx48.rom")) {
+                fprintf(stderr, "No se encuentra zx48.rom\n"); 
+                return 1;
+            }
+            // Copy 48K ROM to both 128K ROM banks
+            memcpy(rom_banks[0], memory, ROM_SIZE);
+            memcpy(rom_banks[1], memory, ROM_SIZE);
+        }
+        printf("Running in 128K mode\n");
+    } else {
+        if (!load_rom("zx48.rom")) { 
+            fprintf(stderr, "No se encuentra zx48.rom\n"); 
+            return 1; 
+        }
+        printf("Running in 48K mode\n");
+    }
 
     z80_init(&cpu);
     cpu.read_byte  = read_byte;
@@ -1550,14 +1693,14 @@ int main(int argc, char** argv) {
     int frame_counter = 0;
     int flash_phase = 0;
 
-    if (argc > 1) {
-        const char* ext = strrchr(argv[1], '.');
+    if (tape_file) {
+        const char* ext = strrchr(tape_file, '.');
         if (ext && strcasecmp(ext, ".tap") == 0) {
-            load_tap(argv[1]);
+            load_tap(tape_file);
         } else if (ext && strcasecmp(ext, ".sna") == 0) {
-            load_sna(argv[1]);
+            load_sna(tape_file);
         } else if (ext && strcasecmp(ext, ".tzx") == 0) {
-            load_tzx(argv[1]);
+            load_tzx(tape_file);
         }
     }
 
