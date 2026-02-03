@@ -1443,8 +1443,8 @@ void displayscanline(int y, int flash_phase) {
         int addr_att = 0x5800 + (32 * (vy >> 3));
 
         for (int bx = 0; bx < 32; bx++) {
-            uint8_t pix = memory[addr_pix++];
-            uint8_t att = memory[addr_att++];
+            uint8_t pix = read_byte(NULL, addr_pix++);
+            uint8_t att = read_byte(NULL, addr_att++);
 
             int bright = (att & 0x40) ? 8 : 0;
             int ink    = (att & 0x07) + bright;
@@ -1596,12 +1596,44 @@ bool load_sna(const char* filename) {
     cpu.interrupt_mode = header[25];
     border_color = header[26] & 0x07;
 
-    if (fread(&memory[RAM_START], 1, 49152, f) != 49152) { fclose(f); fprintf(stderr, "Archivo .sna incompleto (RAM)\n"); return false; }
+    if (!is_128k_mode) {
+        // 48K snapshot: load directly into memory
+        if (fread(&memory[RAM_START], 1, 49152, f) != 49152) { 
+            fclose(f); 
+            fprintf(stderr, "Archivo .sna incompleto (RAM)\n"); 
+            return false; 
+        }
+        
+        uint16_t sp = cpu.sp;
+        cpu.pc = (memory[sp+1] << 8) | memory[sp];
+        cpu.sp += 2;
+    } else {
+        // In 128K mode, load 48K data into RAM banks 5, 2, and 0
+        // Bank 5 (0x4000-0x7FFF)
+        if (fread(ram_banks[5], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
+            fclose(f);
+            fprintf(stderr, "Error loading bank 5 from .sna\n");
+            return false;
+        }
+        // Bank 2 (0x8000-0xBFFF)
+        if (fread(ram_banks[2], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
+            fclose(f);
+            fprintf(stderr, "Error loading bank 2 from .sna\n");
+            return false;
+        }
+        // Bank 0 (0xC000-0xFFFF when port_7ffd=0)
+        if (fread(ram_banks[0], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
+            fclose(f);
+            fprintf(stderr, "Error loading bank 0 from .sna\n");
+            return false;
+        }
+        
+        uint16_t sp = cpu.sp;
+        cpu.pc = (read_byte(NULL, sp+1) << 8) | read_byte(NULL, sp);
+        cpu.sp += 2;
+    }
+    
     fclose(f);
-
-    uint16_t sp = cpu.sp;
-    cpu.pc = (memory[sp+1] << 8) | memory[sp];
-    cpu.sp += 2;
 
     cpu.iff1 = cpu.iff2;
 
