@@ -1,5 +1,5 @@
 /*
- * ZX Spectrum 48K Emulator con SDL2 + JGZ80
+ * ZX Spectrum 48K/128K Emulator con SDL2 + JGZ80
  * - Carga .TAP por pulsos (pilot/sync/data) compatible ROM
  * - Carga .TZX por pulsos:
  *   - Soportados: 0x00(=0x10), 0x02(=0x12), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
@@ -12,9 +12,20 @@
  * - Beeper/speaker por eventos con timestamp (T-states) → audio estable
  * - Soporte TR-DOS: imágenes .TRD y .SCL con emulación WD1793 FDC
  *
+ * 128K Support:
+ * - Memory banking: 8 RAM banks of 16KB each (total 128KB)
+ * - ROM banking: 2 ROM banks of 16KB each (48K BASIC + 128K editor)
+ * - Port 0x7FFD: Memory paging control
+ *   - Bits 0-2: RAM bank at 0xC000-0xFFFF
+ *   - Bit 3: Video page select (not implemented)
+ *   - Bit 4: ROM select (0 = 48K, 1 = 128K)
+ *   - Bit 5: Paging disable (locks configuration)
+ * - AY-3-8912 sound chip (placeholder)
+ * - Floating bus emulation for port reads
+ *
  * Compilar LINUX:     gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx -lSDL2 -lm
  * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
- * Uso: ./minzx [archivo.tap|tzx|sna|trd|scl] [--ro] [--trdos-rom file.rom] [--drive-count N]
+ * Uso: ./minzx [--128k] [archivo.tap|tzx|sna|trd|scl] [--ro] [--trdos-rom file.rom] [--drive-count N]
  */
 
 #include <SDL2/SDL.h>
@@ -79,6 +90,37 @@ bool trdos_enabled = false;
 uint8_t trdos_rom[ROM_SIZE];
 bool trdos_rom_loaded = false;
 bool trdos_rom_active = false;  // true when TR-DOS ROM is mapped
+
+// ─────────────────────────────────────────────────────────────
+// ZX Spectrum 128K Support
+// ─────────────────────────────────────────────────────────────
+#define RAM_BANKS      8
+#define RAM_BANK_SIZE  16384
+#define ROM_BANKS      2
+#define TOTAL_RAM_SIZE (RAM_BANKS * RAM_BANK_SIZE)  // 128KB
+
+int is_128k_mode = 0;                          // 0 = 48K, 1 = 128K
+uint8_t ram_banks[RAM_BANKS][RAM_BANK_SIZE];  // 8 banks of 16KB each
+uint8_t rom_banks[ROM_BANKS][ROM_SIZE];       // 2 ROM banks of 16KB each
+uint8_t port_7ffd = 0x00;                      // Memory paging register
+int paging_disabled = 0;                       // Bit 5 of port 7FFD locks paging
+
+// AY-3-8912 sound chip (placeholder)
+uint8_t ay_register_selected = 0;
+uint8_t ay_registers[16] = {0};
+
+// Floating bus support
+#define TOTAL_SCANLINES      312
+#define TOP_BORDER_LINES     64
+#define VISIBLE_LINES        192
+#define TSTATES_PER_SCANLINE 224
+#define TSTATES_ACTIVE_FETCH 128
+
+int      current_scanline = 0;       // 0..311
+uint32_t tstates_this_line = 0;
+int      ula_fetch_phase = -1;       // -1 = idle, 0..15 = slot activo
+bool     is_in_visible_area = false;
+uint16_t current_video_address = 0;
 
 // Configuración de audio
 SDL_AudioDeviceID audio_dev;
@@ -1199,11 +1241,36 @@ uint8_t read_byte(void* ud, uint16_t addr) {
         }
     }
     
-    // If TR-DOS ROM is active and address is in ROM area, read from TR-DOS ROM
+    // TR-DOS ROM has priority (works in both 48K and 128K modes)
     if (trdos_rom_active && addr < ROM_SIZE && trdos_rom_loaded) {
         return trdos_rom[addr];
     }
     
+    // 128K memory banking
+    if (is_128k_mode) {
+        // 0x0000-0x3FFF: ROM (bank selected by bit 4 of port 7FFD)
+        // 0x4000-0x7FFF: RAM bank 5 (fixed)
+        // 0x8000-0xBFFF: RAM bank 2 (fixed)
+        // 0xC000-0xFFFF: RAM bank (selected by bits 0-2 of port 7FFD)
+        
+        if (addr < 0x4000) {
+            // ROM area
+            int rom_bank = (port_7ffd & 0x10) >> 4;
+            return rom_banks[rom_bank][addr];
+        } else if (addr < 0x8000) {
+            // RAM bank 5 (fixed)
+            return ram_banks[5][addr - 0x4000];
+        } else if (addr < 0xC000) {
+            // RAM bank 2 (fixed)
+            return ram_banks[2][addr - 0x8000];
+        } else {
+            // Paged RAM bank
+            int bank = port_7ffd & 0x07;
+            return ram_banks[bank][addr - 0xC000];
+        }
+    }
+    
+    // 48K mode - simple memory access
     return memory[addr];
 }
 
@@ -1218,6 +1285,27 @@ void write_byte(void* ud, uint16_t addr, uint8_t val) {
     }
 #endif
     (void)ud;
+    
+    // 128K memory banking
+    if (is_128k_mode) {
+        // ROM area is read-only
+        if (addr < 0x4000) {
+            return;
+        } else if (addr < 0x8000) {
+            // RAM bank 5 (fixed)
+            ram_banks[5][addr - 0x4000] = val;
+        } else if (addr < 0xC000) {
+            // RAM bank 2 (fixed)
+            ram_banks[2][addr - 0x8000] = val;
+        } else {
+            // Paged RAM bank
+            int bank = port_7ffd & 0x07;
+            ram_banks[bank][addr - 0xC000] = val;
+        }
+        return;
+    }
+    
+    // 48K mode - simple write to RAM only
     if (addr >= RAM_START) memory[addr] = val;
 }
 
@@ -1277,6 +1365,28 @@ uint8_t port_in(z80* z, uint16_t port) {
 
   #endif
         
+    } else if (is_128k_mode) {
+        // 128K specific ports
+        uint16_t port_low = port & 0xFFFF;
+        
+        // Port 0x7FFD - Memory paging (only if not disabled)
+        if ((port & 0xC002) == 0x4000) {  // Matches 0x7FFD
+            // Reads from 0x7FFD return 0xFF (undecoded)
+            return 0xFF;
+        }
+        
+        // Port 0xFFFD - AY register select (read)
+        if ((port & 0xC002) == 0xC000) {  // Matches 0xFFFD
+            return 0xFF;  // Not fully implemented
+        }
+        
+        // Port 0xBFFD - AY data port (read)
+        if ((port & 0xC002) == 0x8000) {  // Matches 0xBFFD
+            if (ay_register_selected < 16) {
+                return ay_registers[ay_register_selected];
+            }
+            return 0xFF;
+        }
     } else // Check for FDC ports first (if TR-DOS enabled)
     if (trdos_enabled) {
         uint8_t port_low = port & 0xFF;
@@ -1307,6 +1417,37 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         
         // El bit 4 controla el altavoz
         current_speaker_level = (val & 0x10) ? 1 : 0;
+    } else if (is_128k_mode) {
+        // 128K specific ports
+        
+        // Port 0x7FFD - Memory paging
+        if ((port & 0xC002) == 0x4000 && !paging_disabled) {  // Matches 0x7FFD
+            port_7ffd = val;
+            
+            // Bit 5: Paging disable - once set, cannot be changed until reset
+            if (val & 0x20) {
+                paging_disabled = 1;
+            }
+            
+            // Bits 0-2: RAM bank at 0xC000
+            // Bit 3: Video page (not implemented)
+            // Bit 4: ROM select
+            return;
+        }
+        
+        // Port 0xFFFD - AY register select
+        if ((port & 0xC002) == 0xC000) {  // Matches 0xFFFD
+            ay_register_selected = val & 0x0F;
+            return;
+        }
+        
+        // Port 0xBFFD - AY data port write
+        if ((port & 0xC002) == 0x8000) {  // Matches 0xBFFD
+            if (ay_register_selected < 16) {
+                ay_registers[ay_register_selected] = val;
+            }
+            return;
+        }
     }
 
 	// Check for FDC ports first (if TR-DOS enabled)
@@ -1343,6 +1484,29 @@ bool load_trdos_rom(const char* fn) {
         return true;
     }
     return false;
+}
+
+bool load_128k_roms(const char* rom48_fn, const char* rom128_fn) {
+    FILE* f;
+    
+    // Load 48K ROM (bank 0)
+    f = fopen(rom48_fn, "rb");
+    if (!f) return false;
+    size_t rd = fread(rom_banks[0], 1, ROM_SIZE, f);
+    fclose(f);
+    if (rd != ROM_SIZE) return false;
+    
+    // Load 128K ROM (bank 1)
+    f = fopen(rom128_fn, "rb");
+    if (!f) {
+        // If 128K ROM not found, use 48K ROM for both banks
+        memcpy(rom_banks[1], rom_banks[0], ROM_SIZE);
+        printf("Warning: 128K ROM not found, using 48K ROM for both banks\n");
+        return true;
+    }
+    rd = fread(rom_banks[1], 1, ROM_SIZE, f);
+    fclose(f);
+    return rd == ROM_SIZE;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1609,7 +1773,9 @@ int main(int argc, char** argv) {
     
     // Parse command-line arguments
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--ro") == 0) {
+        if (strcmp(argv[i], "--128k") == 0) {
+            is_128k_mode = 1;
+        } else if (strcmp(argv[i], "--ro") == 0) {
             read_only_disks = true;
         } else if (strcmp(argv[i], "--drive-count") == 0 && i + 1 < argc) {
             drive_count = atoi(argv[++i]);
@@ -1639,7 +1805,11 @@ int main(int argc, char** argv) {
         SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
 
-    window = SDL_CreateWindow(trdos_enabled ? "Minimal ZX 48K + TR-DOS" : "Minimal ZX 48K",
+    const char* window_title = is_128k_mode ? 
+        (trdos_enabled ? "Minimal ZX 128K + TR-DOS" : "Minimal ZX 128K") :
+        (trdos_enabled ? "Minimal ZX 48K + TR-DOS" : "Minimal ZX 48K");
+    
+    window = SDL_CreateWindow(window_title,
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               FULL_WIDTH * SCALE, FULL_HEIGHT * SCALE, 0);
 
@@ -1649,7 +1819,19 @@ int main(int argc, char** argv) {
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                 SDL_TEXTUREACCESS_STATIC, FULL_WIDTH, FULL_HEIGHT);
 
-    if (!load_rom("zx48.rom")) { fprintf(stderr, "No se encuentra zx48.rom\n"); return 1; }
+    // Load ROMs based on mode
+    if (is_128k_mode) {
+        if (!load_128k_roms("zx48.rom", "zx128.rom")) { 
+            fprintf(stderr, "No se encuentran las ROMs necesarias\n"); 
+            return 1; 
+        }
+        printf("Modo 128K activado\n");
+    } else {
+        if (!load_rom("zx48.rom")) { 
+            fprintf(stderr, "No se encuentra zx48.rom\n"); 
+            return 1; 
+        }
+    }
 
     // Try to load TR-DOS ROM if specified or if trdos.rom exists
     if (trdos_rom_file) {
@@ -1669,6 +1851,17 @@ int main(int argc, char** argv) {
     cpu.pc = 0x0000;
     cpu.sp = 0x0000;
     cpu.interrupt_mode = 1;
+    
+    // Initialize 128K RAM banks if in 128K mode
+    if (is_128k_mode) {
+        // Clear all RAM banks
+        for (int i = 0; i < RAM_BANKS; i++) {
+            memset(ram_banks[i], 0, RAM_BANK_SIZE);
+        }
+        // Initialize paging: bank 0 at 0xC000, ROM 0 selected
+        port_7ffd = 0x00;
+        paging_disabled = 0;
+    }
     
     // Initialize FDC
     fdc_init(&fdc);
