@@ -14,11 +14,28 @@ Using [z80cpp emulator core](https://github.com/jsanchezv/z80cpp) from [José Lu
 - ROM paging (2 ROM banks for 128K mode)
 - AY-3-8912 sound chip emulation (placeholder)
 - Tape loading support (TAP and TZX formats)
+- **Floating bus emulation**: Accurate ULA fetch state tracking for undecoded port reads
 
 ### Missing features:
 
 - No keyboard yet
 - AY sound chip (placeholder only, no actual sound generation)
+
+## Technical Details
+
+### Floating Bus
+
+The emulator includes accurate floating bus emulation. When reading from undecoded I/O ports (except Kempston joystick at 0x1F), the emulator returns the value currently being fetched by the ULA from video memory. This is a hardware characteristic of the ZX Spectrum that some programs rely on for:
+- Pseudo-random number generation
+- Timing-sensitive operations
+- Detection of specific hardware
+
+The floating bus implementation tracks:
+- Current scanline position (0-311)
+- ULA fetch phase (during the first 128 T-states of visible scanlines)
+- Video memory address being accessed (pixel data or attributes)
+
+During non-visible scanlines or when ULA is not actively fetching, undecoded ports return 0xFF.
 
 As there is no input method yet, only way to test the emulator is to load some game from .SNA which has demo mode, such as Manic Miner.
 
