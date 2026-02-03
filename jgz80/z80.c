@@ -10,7 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 
-// Parity lookup table
+// Parity lookup table - not thread-safe, initialize before multi-threaded use
 static uint8_t parity_table[256];
 static bool parity_initialized = false;
 

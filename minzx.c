@@ -1596,7 +1596,7 @@ int main(int argc, char** argv) {
         SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
 
-    window = SDL_CreateWindow("Minimal ZX 48K + TR-DOS",
+    window = SDL_CreateWindow(trdos_enabled ? "Minimal ZX 48K + TR-DOS" : "Minimal ZX 48K",
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               FULL_WIDTH * SCALE, FULL_HEIGHT * SCALE, 0);
 

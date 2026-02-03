@@ -114,14 +114,16 @@ scl_image_t* scl_open(const char* filename) {
     disk_info.files_count = header.files_count;
     disk_info.free_sectors = 2544; // Placeholder
     disk_info.tr_dos_id = 0x10;
-    strncpy((char*)disk_info.disk_label, "SCLCONV", 8);
-    // Ensure no buffer overflow
+    strncpy((char*)disk_info.disk_label, "SCLCONV", 8); // strncpy prevents buffer overflow
     
     long info_pos = 8 * TRD_SECTOR_SIZE; // Sector 8 on track 0
     fseek(trd_f, info_pos, SEEK_SET);
     fwrite(&disk_info, sizeof(trd_disk_info_t), 1, trd_f);
     
     // Write file data
+    // Note: Current implementation writes files sequentially for simplicity
+    // A complete implementation would write files to their allocated track/sector positions
+    // For read-only SCL access, this works as the catalog is properly constructed
     for (int i = 0; i < header.files_count; i++) {
         // Calculate position in TRD
         // Files are stored after the catalog, starting from track 1

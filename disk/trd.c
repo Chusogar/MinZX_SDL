@@ -87,7 +87,12 @@ trd_image_t* trd_open(const char* filename, bool read_only) {
         case 0x17: img->tracks = 40; img->sides = 2; break;
         case 0x18: img->tracks = 80; img->sides = 1; break;
         default:
-            // Use file size to determine
+            // Unknown disk type - verify against file size
+            if (size == 327680 && img->disk_info.disk_type != 0x16) {
+                // More likely to be 40 tracks DS if file size matches
+                fprintf(stderr, "TRD: Warning: Unknown disk type 0x%02X, using geometry from file size\n", 
+                        img->disk_info.disk_type);
+            }
             break;
     }
     
@@ -109,8 +114,9 @@ trd_image_t* trd_open(const char* filename, bool read_only) {
         }
     }
     
-    printf("TRD: Opened '%s' - %d tracks, %d side%s, %d files\n",
-           filename, img->tracks, img->sides, img->sides > 1 ? "s" : "", img->files_loaded);
+    printf("TRD: Opened '%s' - %d tracks, %d side%s, %d/%d files loaded\n",
+           filename, img->tracks, img->sides, img->sides > 1 ? "s" : "", 
+           img->files_loaded, img->disk_info.files_count);
     
     return img;
 }
