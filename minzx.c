@@ -1,5 +1,5 @@
 /*
- * ZX Spectrum 48K Emulator con SDL2 + JGZ80
+ * ZX Spectrum 48K/128K Emulator con SDL2 + JGZ80
  * - Carga .TAP por pulsos (pilot/sync/data) compatible ROM
  * - Carga .TZX por pulsos:
  *   - Soportados: 0x00(=0x10), 0x02(=0x12), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
@@ -11,9 +11,21 @@
  * - Puerto FE: bit 6 = EAR (tape); bit 7 = espejo de bit 3 del último OUT
  * - Beeper/speaker por eventos con timestamp (T-states) → audio estable
  *
+ * 128K Support:
+ * - Memory banking: 8 RAM banks of 16KB each (total 128KB)
+ * - ROM banking: 2 ROM banks of 16KB each (48K BASIC + 128K editor)
+ * - Port 0x7FFD: Memory paging control
+ *   - Bits 0-2: RAM bank at 0xC000-0xFFFF
+ *   - Bit 3: Video page select (not implemented)
+ *   - Bit 4: ROM select (0 = 48K, 1 = 128K)
+ *   - Bit 5: Paging disable (locks configuration)
+ * - AY-3-8912 sound chip (placeholder):
+ *   - Port 0xFFFD: Register select
+ *   - Port 0xBFFD: Data write/read
+ *
  * Compilar LINUX:     gcc minzx.c jgz80/z80.c -o minzx -lSDL2 -lm
  * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
- * Uso: ./minzx [cinta.tap | cinta.tzx | snapshot.sna]
+ * Uso: ./minzx [--128k] [cinta.tap | cinta.tzx | snapshot.sna]
  */
 
 #include <SDL2/SDL.h>
@@ -44,11 +56,28 @@
 #define MEMORY_SIZE    (64*1024)
 #define CYCLES_PER_FRAME 69888
 
+// 128K Memory layout
+#define RAM_BANKS      8
+#define RAM_BANK_SIZE  16384
+#define ROM_BANKS      2
+#define TOTAL_RAM_SIZE (RAM_BANKS * RAM_BANK_SIZE)  // 128KB
+
 // ─────────────────────────────────────────────────────────────
 // Globals
 // ─────────────────────────────────────────────────────────────
 uint8_t memory[MEMORY_SIZE];
 z80 cpu;
+
+// 128K specific memory
+int is_128k_mode = 0;                          // 0 = 48K, 1 = 128K
+uint8_t ram_banks[RAM_BANKS][RAM_BANK_SIZE];  // 8 banks of 16KB each
+uint8_t rom_banks[ROM_BANKS][ROM_SIZE];       // 2 ROM banks of 16KB each
+uint8_t port_7ffd = 0x00;                      // Memory paging register
+int paging_disabled = 0;                       // Bit 5 of port 7FFD locks paging
+
+// AY-3-8912 sound chip (placeholder)
+uint8_t ay_register_selected = 0;
+uint8_t ay_registers[16] = {0};
 
 SDL_Window*   window   = NULL;
 SDL_Renderer* renderer = NULL;
@@ -62,6 +91,19 @@ uint8_t keyboard[8]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 int      cycles_done   = 0;     // puede replegarse por frame
 uint64_t global_cycles = 0;     // SIEMPRE crece → referencia para cinta/audio
+
+// Floating bus support - scanline and ULA fetch tracking
+#define TOTAL_SCANLINES      312
+#define TOP_BORDER_LINES     64
+#define VISIBLE_LINES        192
+#define TSTATES_PER_SCANLINE 224
+#define TSTATES_ACTIVE_FETCH 128
+
+int      current_scanline = 0;       // 0..311
+uint32_t tstates_this_line = 0;
+int      ula_fetch_phase = -1;       // -1 = idle, 0..15 = slot activo
+bool     is_in_visible_area = false;
+uint16_t current_video_address = 0;
 
 // Configuración de audio
 SDL_AudioDeviceID audio_dev;
@@ -1172,7 +1214,32 @@ uint8_t read_byte(void* ud, uint16_t addr) {
     }
 #endif
     (void)ud;
-    return memory[addr];
+    
+    if (!is_128k_mode) {
+        return memory[addr];
+    }
+    
+    // 128K memory mapping
+    // 0x0000-0x3FFF: ROM (bank selected by bit 4 of port 7FFD)
+    // 0x4000-0x7FFF: RAM bank 5 (fixed)
+    // 0x8000-0xBFFF: RAM bank 2 (fixed)
+    // 0xC000-0xFFFF: RAM bank (selected by bits 0-2 of port 7FFD)
+    
+    if (addr < 0x4000) {
+        // ROM area
+        int rom_bank = (port_7ffd & 0x10) >> 4;
+        return rom_banks[rom_bank][addr];
+    } else if (addr < 0x8000) {
+        // RAM bank 5 (fixed)
+        return ram_banks[5][addr - 0x4000];
+    } else if (addr < 0xC000) {
+        // RAM bank 2 (fixed)
+        return ram_banks[2][addr - 0x8000];
+    } else {
+        // Paged RAM bank
+        int bank = port_7ffd & 0x07;
+        return ram_banks[bank][addr - 0xC000];
+    }
 }
 
 void write_byte(void* ud, uint16_t addr, uint8_t val) {
@@ -1186,7 +1253,85 @@ void write_byte(void* ud, uint16_t addr, uint8_t val) {
     }
 #endif
     (void)ud;
-    if (addr >= RAM_START) memory[addr] = val;
+    
+    if (!is_128k_mode) {
+        if (addr >= RAM_START) memory[addr] = val;
+        return;
+    }
+    
+    // 128K memory mapping (ROM is read-only)
+    if (addr < 0x4000) {
+        // ROM area - ignore writes
+        return;
+    } else if (addr < 0x8000) {
+        // RAM bank 5 (fixed)
+        ram_banks[5][addr - 0x4000] = val;
+    } else if (addr < 0xC000) {
+        // RAM bank 2 (fixed)
+        ram_banks[2][addr - 0x8000] = val;
+    } else {
+        // Paged RAM bank
+        int bank = port_7ffd & 0x07;
+        ram_banks[bank][addr - 0xC000] = val;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Floating Bus - ULA fetch state tracking
+// ─────────────────────────────────────────────────────────────
+void update_ula_fetch_state() {
+    // Calculate T-states within current scanline
+    uint32_t t_in_line = cycles_done % TSTATES_PER_SCANLINE;
+    
+    // Check if we're in the visible area (scanlines 64-255)
+    if (current_scanline < TOP_BORDER_LINES || 
+        current_scanline >= TOP_BORDER_LINES + VISIBLE_LINES) {
+        is_in_visible_area = false;
+        ula_fetch_phase = -1;
+        current_video_address = 0;
+        return;
+    }
+    
+    is_in_visible_area = true;
+    
+    // Check if we're past the active fetch period (128 T-states)
+    if (t_in_line >= TSTATES_ACTIVE_FETCH) {
+        ula_fetch_phase = -1;
+        current_video_address = 0;
+        return;
+    }
+    
+    // Calculate fetch slot (0-15) and sub-T-state within slot (0-7)
+    int slot = t_in_line / 8;
+    int sub_t = t_in_line % 8;
+    
+    // ULA only fetches during first 4 T-states of each 8 T-state slot
+    if (sub_t >= 4) {
+        ula_fetch_phase = -1;
+        current_video_address = 0;
+        return;
+    }
+    
+    ula_fetch_phase = slot;
+    
+    // Calculate which character column (0-31) and whether we're fetching attribute
+    int char_x = slot * 2 + (sub_t / 2);
+    bool is_attr = (sub_t % 2) == 1;
+    
+    // Calculate Y coordinate in visible area (0-191)
+    int spe_y = current_scanline - TOP_BORDER_LINES;
+    
+    // Calculate ULA's Y coordinate (with line interleaving)
+    // Y = bits 7-6 | bits 2-0 | bits 5-3
+    int ula_y = ((spe_y & 0xC0) | ((spe_y & 0x38) >> 3) | ((spe_y & 0x07) << 3));
+    
+    if (is_attr) {
+        // Attribute: 0x5800 + (Y/8)*32 + X
+        current_video_address = 0x5800 + ((spe_y >> 3) << 5) + char_x;
+    } else {
+        // Pixel data: 0x4000 + ULA_Y*32 + X
+        current_video_address = 0x4000 + (ula_y << 5) + char_x;
+    }
 }
 
 uint8_t port_in(z80* z, uint16_t port) {
@@ -1245,12 +1390,34 @@ uint8_t port_in(z80* z, uint16_t port) {
 
   #endif
         
-    } else if ((port&0xff) == 0x1f ) // Joystick Kempston
-	{
+        return res;  // Port 0xFE handled - return directly
+    } 
+    
+    // Joystick Kempston
+    if ((port & 0xff) == 0x1f) {
 		return 0xff;
 	}
-
-    return res;
+    
+    // AY-3-8912 sound chip data read (port 0xFFFD in 128K mode)
+    if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
+        if (ay_register_selected < 16) {
+            return ay_registers[ay_register_selected];
+        }
+    }
+    
+    // Floating bus para puertos no decodificados
+    update_ula_fetch_state();
+    
+    if (!is_in_visible_area || ula_fetch_phase < 0) {
+        return 0xFF;  // Not in visible area or not during fetch
+    }
+    
+    // Return the video memory byte that ULA is currently fetching
+    if (is_128k_mode) {
+        return read_byte(NULL, current_video_address);
+    } else {
+        return memory[current_video_address];
+    }
 }
 
 
@@ -1269,6 +1436,53 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         // El bit 4 controla el altavoz
         current_speaker_level = (val & 0x10) ? 1 : 0;
     }
+    
+    // 128K memory paging (port 0x7FFD)
+    if (is_128k_mode && (port & 0xC002) == 0x4000) {  // Port 0x7FFD
+        if (!paging_disabled) {
+            uint8_t old_port_7ffd = port_7ffd;
+            port_7ffd = val;
+            
+            // Bit 5: If set, disable further paging (until reset)
+            if (val & 0x20) {
+                paging_disabled = 1;
+                printf("[128K] Paginación bloqueada por escritura en puerto 0x7FFD: 0x%02X\n", val);
+            }
+            
+            // Debug logging for bank switches
+            if ((old_port_7ffd & 0x07) != (val & 0x07)) {
+                printf("[128K] Banco RAM en 0xC000 cambiado de %d a %d\n", 
+                       old_port_7ffd & 0x07, val & 0x07);
+            }
+            if ((old_port_7ffd & 0x10) != (val & 0x10)) {
+                printf("[128K] Banco ROM cambiado a %s\n", 
+                       (val & 0x10) ? "ROM 1 (editor 128K)" : "ROM 0 (BASIC 48K)");
+            }
+            
+            // Bits 0-2: RAM page at 0xC000-0xFFFF
+            // Bit 3: Video page (0 = bank 5, 1 = bank 7) - not implemented yet
+            // Bit 4: ROM select (0 = 48K ROM, 1 = 128K ROM)
+            // Bit 5: Paging disable
+        } else {
+            printf("[128K] Escritura de paginación ignorada (bloqueada): puerto=0x%04X val=0x%02X\n", port, val);
+        }
+    }
+    
+    // AY-3-8912 sound chip registers (placeholder)
+    // Port 0xFFFD: Register select
+    if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
+        ay_register_selected = val & 0x0F;  // Only 16 registers
+        printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_register_selected);
+    }
+    
+    // Port 0xBFFD: Data write
+    if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
+        if (ay_register_selected < 16) {
+            ay_registers[ay_register_selected] = val;
+            printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_register_selected, val);
+            // Placeholder: Actual AY-3-8912 sound generation would go here
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1280,6 +1494,18 @@ bool load_rom(const char* fn) {
     size_t rd = fread(memory, 1, ROM_SIZE, f);
     fclose(f);
     return rd == ROM_SIZE;
+}
+
+bool load_128k_rom(const char* fn) {
+    FILE* f = fopen(fn, "rb");
+    if (!f) return false;
+    
+    // Load both 16KB ROM banks (total 32KB)
+    size_t rd0 = fread(rom_banks[0], 1, ROM_SIZE, f);
+    size_t rd1 = fread(rom_banks[1], 1, ROM_SIZE, f);
+    fclose(f);
+    
+    return (rd0 == ROM_SIZE && rd1 == ROM_SIZE);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1303,8 +1529,8 @@ void displayscanline(int y, int flash_phase) {
         int addr_att = 0x5800 + (32 * (vy >> 3));
 
         for (int bx = 0; bx < 32; bx++) {
-            uint8_t pix = memory[addr_pix++];
-            uint8_t att = memory[addr_att++];
+            uint8_t pix = read_byte(NULL, addr_pix++);
+            uint8_t att = read_byte(NULL, addr_att++);
 
             int bright = (att & 0x40) ? 8 : 0;
             int ink    = (att & 0x07) + bright;
@@ -1456,12 +1682,44 @@ bool load_sna(const char* filename) {
     cpu.interrupt_mode = header[25];
     border_color = header[26] & 0x07;
 
-    if (fread(&memory[RAM_START], 1, 49152, f) != 49152) { fclose(f); fprintf(stderr, "Archivo .sna incompleto (RAM)\n"); return false; }
+    if (!is_128k_mode) {
+        // 48K snapshot: load directly into memory
+        if (fread(&memory[RAM_START], 1, 49152, f) != 49152) { 
+            fclose(f); 
+            fprintf(stderr, "Archivo .sna incompleto (RAM)\n"); 
+            return false; 
+        }
+        
+        uint16_t sp = cpu.sp;
+        cpu.pc = (memory[sp+1] << 8) | memory[sp];
+        cpu.sp += 2;
+    } else {
+        // In 128K mode, load 48K data into RAM banks 5, 2, and 0
+        // Bank 5 (0x4000-0x7FFF)
+        if (fread(ram_banks[5], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
+            fclose(f);
+            fprintf(stderr, "Error cargando banco 5 desde .sna\n");
+            return false;
+        }
+        // Bank 2 (0x8000-0xBFFF)
+        if (fread(ram_banks[2], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
+            fclose(f);
+            fprintf(stderr, "Error cargando banco 2 desde .sna\n");
+            return false;
+        }
+        // Bank 0 (0xC000-0xFFFF when port_7ffd=0)
+        if (fread(ram_banks[0], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
+            fclose(f);
+            fprintf(stderr, "Error cargando banco 0 desde .sna\n");
+            return false;
+        }
+        
+        uint16_t sp = cpu.sp;
+        cpu.pc = (read_byte(NULL, sp+1) << 8) | read_byte(NULL, sp);
+        cpu.sp += 2;
+    }
+    
     fclose(f);
-
-    uint16_t sp = cpu.sp;
-    cpu.pc = (memory[sp+1] << 8) | memory[sp];
-    cpu.sp += 2;
 
     cpu.iff1 = cpu.iff2;
 
@@ -1505,6 +1763,16 @@ bool load_tap(const char* filename) {
 // Main
 // ─────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+    // Parse command-line arguments
+    const char* tape_file = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--128k") == 0) {
+            is_128k_mode = 1;
+        } else {
+            tape_file = argv[i];
+        }
+    }
+    
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -1525,7 +1793,8 @@ int main(int argc, char** argv) {
         SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
 
-    window = SDL_CreateWindow("Minimal ZX 48K",
+    const char* window_title = is_128k_mode ? "Minimal ZX 128K" : "Minimal ZX 48K";
+    window = SDL_CreateWindow(window_title,
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               FULL_WIDTH * SCALE, FULL_HEIGHT * SCALE, 0);
 
@@ -1535,7 +1804,27 @@ int main(int argc, char** argv) {
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                 SDL_TEXTUREACCESS_STATIC, FULL_WIDTH, FULL_HEIGHT);
 
-    if (!load_rom("zx48.rom")) { fprintf(stderr, "No se encuentra zx48.rom\n"); return 1; }
+    // Load appropriate ROM
+    if (is_128k_mode) {
+        if (!load_128k_rom("zx128.rom")) { 
+            fprintf(stderr, "No se encuentra zx128.rom, intentando zx48.rom en 128K mode\n");
+            // Fallback: load 48K ROM into both banks
+            if (!load_rom("zx48.rom")) {
+                fprintf(stderr, "No se encuentra zx48.rom\n"); 
+                return 1;
+            }
+            // Copy 48K ROM to both 128K ROM banks
+            memcpy(rom_banks[0], memory, ROM_SIZE);
+            memcpy(rom_banks[1], memory, ROM_SIZE);
+        }
+        printf("Ejecutando en modo 128K\n");
+    } else {
+        if (!load_rom("zx48.rom")) { 
+            fprintf(stderr, "No se encuentra zx48.rom\n"); 
+            return 1; 
+        }
+        printf("Ejecutando en modo 48K\n");
+    }
 
     z80_init(&cpu);
     cpu.read_byte  = read_byte;
@@ -1546,30 +1835,48 @@ int main(int argc, char** argv) {
     cpu.sp = 0x0000;
     cpu.interrupt_mode = 1;
 
+    // Initialize RAM banks in 128K mode
+    if (is_128k_mode) {
+        // Clear all RAM banks
+        for (int i = 0; i < RAM_BANKS; i++) {
+            memset(ram_banks[i], 0, RAM_BANK_SIZE);
+        }
+        // Initialize paging: Bank 0 at 0xC000, ROM 0 selected
+        port_7ffd = 0x00;
+        paging_disabled = 0;
+        printf("Bancos RAM 128K inicializados\n");
+    }
 
     int frame_counter = 0;
     int flash_phase = 0;
 
-    if (argc > 1) {
-        const char* ext = strrchr(argv[1], '.');
+    if (tape_file) {
+        const char* ext = strrchr(tape_file, '.');
         if (ext && strcasecmp(ext, ".tap") == 0) {
-            load_tap(argv[1]);
+            load_tap(tape_file);
         } else if (ext && strcasecmp(ext, ".sna") == 0) {
-            load_sna(argv[1]);
+            load_sna(tape_file);
         } else if (ext && strcasecmp(ext, ".tzx") == 0) {
-            load_tzx(argv[1]);
+            load_tzx(tape_file);
         }
     }
 
     while (true) {
         handle_input();
         
+        // Reset scanline counter at start of frame
+        current_scanline = 0;
+        
         for (int line = 0; line < FULL_HEIGHT; line++) {
+            current_scanline = line;
+            tstates_this_line = 0;
+            
             z80_step_n(&cpu, 224);
             displayscanline(line, flash_phase);
             
             cycles_done   += (224);
             global_cycles += (uint64_t)224;
+            tstates_this_line += 224;
             //generate_audio(cycles_done);
 
             if (line == (FULL_HEIGHT -1)) {z80_pulse_irq(&cpu, 1); /*generate_audio(69888);*/}
