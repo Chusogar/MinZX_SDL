@@ -1390,8 +1390,11 @@ uint8_t port_in(z80* z, uint16_t port) {
 
   #endif
         
-    } else if ((port&0xff) == 0x1f ) // Joystick Kempston
-	{
+        return res;  // Port 0xFE handled - return directly
+    } 
+    
+    // Joystick Kempston
+    if ((port & 0xff) == 0x1f) {
 		return 0xff;
 	}
     
@@ -1402,22 +1405,19 @@ uint8_t port_in(z80* z, uint16_t port) {
         }
     }
     
-    // Floating bus para puertos no decodificados (excepto Kempston)
-    // Solo aplica si no es el puerto Kempston (0x1F)
-    if ((port & 0xFF) != 0x1F) {
-        update_ula_fetch_state();
-        
-        if (is_in_visible_area && ula_fetch_phase >= 0) {
-            // Return the video memory byte that ULA is currently fetching
-            if (is_128k_mode) {
-                return read_byte(NULL, current_video_address);
-            } else {
-                return memory[current_video_address];
-            }
-        }
+    // Floating bus para puertos no decodificados
+    update_ula_fetch_state();
+    
+    if (!is_in_visible_area || ula_fetch_phase < 0) {
+        return 0xFF;  // Not in visible area or not during fetch
     }
-
-    return res;
+    
+    // Return the video memory byte that ULA is currently fetching
+    if (is_128k_mode) {
+        return read_byte(NULL, current_video_address);
+    } else {
+        return memory[current_video_address];
+    }
 }
 
 
