@@ -1360,17 +1360,17 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
             // Bit 5: If set, disable further paging (until reset)
             if (val & 0x20) {
                 paging_disabled = 1;
-                printf("[128K] Paging locked by port 0x7FFD write: 0x%02X\n", val);
+                printf("[128K] Paginación bloqueada por escritura en puerto 0x7FFD: 0x%02X\n", val);
             }
             
             // Debug logging for bank switches
             if ((old_port_7ffd & 0x07) != (val & 0x07)) {
-                printf("[128K] RAM bank at 0xC000 switched from %d to %d\n", 
+                printf("[128K] Banco RAM en 0xC000 cambiado de %d a %d\n", 
                        old_port_7ffd & 0x07, val & 0x07);
             }
             if ((old_port_7ffd & 0x10) != (val & 0x10)) {
-                printf("[128K] ROM bank switched to %s\n", 
-                       (val & 0x10) ? "ROM 1 (128K editor)" : "ROM 0 (48K BASIC)");
+                printf("[128K] Banco ROM cambiado a %s\n", 
+                       (val & 0x10) ? "ROM 1 (editor 128K)" : "ROM 0 (BASIC 48K)");
             }
             
             // Bits 0-2: RAM page at 0xC000-0xFFFF
@@ -1378,7 +1378,7 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
             // Bit 4: ROM select (0 = 48K ROM, 1 = 128K ROM)
             // Bit 5: Paging disable
         } else {
-            printf("[128K] Paging write ignored (locked): port=0x%04X val=0x%02X\n", port, val);
+            printf("[128K] Escritura de paginación ignorada (bloqueada): puerto=0x%04X val=0x%02X\n", port, val);
         }
     }
     
@@ -1386,14 +1386,14 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
     // Port 0xFFFD: Register select
     if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
         ay_register_selected = val & 0x0F;  // Only 16 registers
-        printf("[AY] Register selected: %d (port 0xFFFD)\n", ay_register_selected);
+        printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_register_selected);
     }
     
     // Port 0xBFFD: Data write
     if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
         if (ay_register_selected < 16) {
             ay_registers[ay_register_selected] = val;
-            printf("[AY] Register %d = 0x%02X (port 0xBFFD)\n", ay_register_selected, val);
+            printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_register_selected, val);
             // Placeholder: Actual AY-3-8912 sound generation would go here
         }
     }
@@ -1612,19 +1612,19 @@ bool load_sna(const char* filename) {
         // Bank 5 (0x4000-0x7FFF)
         if (fread(ram_banks[5], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
             fclose(f);
-            fprintf(stderr, "Error loading bank 5 from .sna\n");
+            fprintf(stderr, "Error cargando banco 5 desde .sna\n");
             return false;
         }
         // Bank 2 (0x8000-0xBFFF)
         if (fread(ram_banks[2], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
             fclose(f);
-            fprintf(stderr, "Error loading bank 2 from .sna\n");
+            fprintf(stderr, "Error cargando banco 2 desde .sna\n");
             return false;
         }
         // Bank 0 (0xC000-0xFFFF when port_7ffd=0)
         if (fread(ram_banks[0], 1, RAM_BANK_SIZE, f) != RAM_BANK_SIZE) {
             fclose(f);
-            fprintf(stderr, "Error loading bank 0 from .sna\n");
+            fprintf(stderr, "Error cargando banco 0 desde .sna\n");
             return false;
         }
         
@@ -1731,13 +1731,13 @@ int main(int argc, char** argv) {
             memcpy(rom_banks[0], memory, ROM_SIZE);
             memcpy(rom_banks[1], memory, ROM_SIZE);
         }
-        printf("Running in 128K mode\n");
+        printf("Ejecutando en modo 128K\n");
     } else {
         if (!load_rom("zx48.rom")) { 
             fprintf(stderr, "No se encuentra zx48.rom\n"); 
             return 1; 
         }
-        printf("Running in 48K mode\n");
+        printf("Ejecutando en modo 48K\n");
     }
 
     z80_init(&cpu);
@@ -1758,7 +1758,7 @@ int main(int argc, char** argv) {
         // Initialize paging: Bank 0 at 0xC000, ROM 0 selected
         port_7ffd = 0x00;
         paging_disabled = 0;
-        printf("128K RAM banks initialized\n");
+        printf("Bancos RAM 128K inicializados\n");
     }
 
     int frame_counter = 0;

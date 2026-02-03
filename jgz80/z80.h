@@ -18,10 +18,10 @@ typedef struct z80_s {
     uint8_t interrupt_mode;
     
     // Memory and I/O callbacks
-    uint8_t (*read_byte)(uint16_t addr);
-    void (*write_byte)(uint16_t addr, uint8_t val);
-    uint8_t (*port_in)(uint16_t port);
-    void (*port_out)(uint16_t port, uint8_t val);
+    uint8_t (*read_byte)(void* ud, uint16_t addr);
+    void (*write_byte)(void* ud, uint16_t addr, uint8_t val);
+    uint8_t (*port_in)(struct z80_s* z, uint16_t port);
+    void (*port_out)(struct z80_s* z, uint16_t port, uint8_t val);
 } z80;
 
 // Function prototypes
