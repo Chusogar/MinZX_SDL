@@ -1194,7 +1194,7 @@ uint8_t read_byte(void* ud, uint16_t addr) {
     if (trdos_rom_loaded) {
         if ((cpu.pc & 0xFF00) == 0x3D00) {
             trdos_rom_active = true;
-        } else if ((cpu.pc & 0xFF00) != 0x3D00 && trdos_rom_active) {
+        } else if ((cpu.pc >= 0x4000) && trdos_rom_active) {
             trdos_rom_active = false;
         }
     }
@@ -1230,14 +1230,7 @@ uint8_t port_in(z80* z, uint16_t port) {
 		printf("puerto %d\n", (port&0xff));
 	}*/
 
-	// Check for FDC ports first (if TR-DOS enabled)
-    if (trdos_enabled) {
-        uint8_t port_low = port & 0xFF;
-        if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
-            port_low == 0x7F || port_low == 0xFF) {
-            return fdc_port_in(&fdc, port);
-        }
-    }
+	
 
     if ((port & 1) == 0) { // FE
 		res = 0xbf;
@@ -1284,10 +1277,15 @@ uint8_t port_in(z80* z, uint16_t port) {
 
   #endif
         
-    } else if ((port&0xff) == 0x1f ) // Joystick Kempston
-	{
-		return 0xff;
-	}
+    } else // Check for FDC ports first (if TR-DOS enabled)
+    if (trdos_enabled) {
+        uint8_t port_low = port & 0xFF;
+        if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
+            port_low == 0x7F || port_low == 0xFF) {
+			printf("TRDOS IN: %X\n", port_low);
+            return fdc_port_in(&fdc, port);
+        }
+    }
 
     return res;
 }
@@ -1298,15 +1296,6 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
     (void)z;
 	//printf("out %d=%d", port, val);
 	
-	// Check for FDC ports first (if TR-DOS enabled)
-    if (trdos_enabled) {
-        uint8_t port_low = port & 0xFF;
-        if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
-            port_low == 0x7F || port_low == 0xFF) {
-            fdc_port_out(&fdc, port, val);
-            return;
-        }
-    }
 	
     if ((port & 1) == 0) {
         border_color   = val & 0x07;
@@ -1318,6 +1307,17 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         
         // El bit 4 controla el altavoz
         current_speaker_level = (val & 0x10) ? 1 : 0;
+    }
+
+	// Check for FDC ports first (if TR-DOS enabled)
+    if (trdos_enabled) {
+        uint8_t port_low = port & 0xFF;
+        if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
+            port_low == 0x7F || port_low == 0xFF) {
+			printf("TRDOS OUT: %X Val=%d\n", port_low, val);
+            fdc_port_out(&fdc, port, val);
+            return;
+        }
     }
 }
 
