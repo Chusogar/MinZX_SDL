@@ -1,19 +1,206 @@
 # MinZX_SDL
-A minimal ZX Spectrum emulator, written in C++, using SDL, compiled with Visual Studio.
+A minimal ZX Spectrum emulator using SDL.
 
-Using [z80cpp emulator core](https://github.com/jsanchezv/z80cpp) from [José Luis Sánchez](https://github.com/jsanchezv).
+This repository contains two implementations:
+- **C version** (`minzx.c`) - Standalone C implementation with jgz80 CPU core
+- **C++ version** (`src/`) - Visual Studio project with z80cpp core
 
-Emulator barely working. Working features:
+The C version now includes complete TR-DOS disk support.
 
-- Boot into Spectrum Basic.
-- Can load SNA files from command line.
+Using a simple jgz80 Z80 emulator core (based on concepts from [z80cpp](https://github.com/jsanchezv/z80cpp) by José Luis Sánchez).
 
-Missing features:
+## Features
 
-- No keyboard yet
-- No sound yet
+### Working Features:
 
-As there is no input method yet, only way to test the emulator is to load some game from .SNA which has demo mode, such as Manic Miner.
+- Boot into Spectrum Basic
+- Load SNA files from command line
+- Load TAP files (tape emulation with proper timing)
+- Load TZX files (advanced tape format with multiple block types)
+- **TR-DOS disk support** - Load and use .TRD and .SCL disk images
+- WD1793 FDC emulation for disk operations
+- Keyboard input
+- Audio/beeper emulation
+- Video with proper border, BRIGHT attribute support
 
+### TR-DOS Disk Support
 
+The emulator now supports TR-DOS disk images in two formats:
+
+- **.TRD** - Standard TR-DOS disk image format (read/write support)
+- **.SCL** - Sinclair Computer Language archive format (read-only)
+
+#### FDC Emulation
+
+- WD1793-compatible floppy disk controller
+- Support for up to 4 disk drives
+- Proper T-state based timing
+- Sector read/write operations
+- TR-DOS compatible port mapping (0x1F, 0x3F, 0x5F, 0x7F, 0xFF)
+
+## Building
+
+### Linux
+```bash
+gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx -lSDL2 -lm
+```
+
+### Windows (MSYS2)
+```bash
+gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
+```
+
+### Visual Studio
+Open `MinZX_SDL.sln` and build (Note: C++ version in `src/` directory)
+
+## Usage
+
+### Basic Usage
+```bash
+./minzx                          # Boot to BASIC
+./minzx game.sna                 # Load snapshot
+./minzx tape.tap                 # Load tape
+./minzx tape.tzx                 # Load TZX tape
+```
+
+### TR-DOS Disk Usage
+```bash
+# Mount a single TRD image to drive A:
+./minzx disk.trd
+
+# Mount multiple disk images to drives A: and B:
+./minzx disk1.trd disk2.trd
+
+# Mount in read-only mode
+./minzx disk.trd --ro
+
+# Mount SCL archive
+./minzx archive.scl
+
+# Specify number of drives (1-4, default 2)
+./minzx disk.trd --drive-count 4
+
+# Load TR-DOS ROM explicitly
+./minzx disk.trd --trdos-rom trdos.rom
+
+# TR-DOS ROM is loaded automatically if trdos.rom exists in the current directory
+```
+
+### Keyboard Shortcuts
+
+- **ESC** - Exit emulator
+- **F6** - Reload current tape
+- **F7** - Play/pause tape
+- **F8** - List mounted disks and show directory
+- **F9** - Manual TR-DOS ROM toggle (optional - ROM auto-switches based on PC)
+- **F12** - Reset (CPU reset)
+
+### TR-DOS ROM
+
+The emulator can load a TR-DOS ROM to enable full TR-DOS functionality:
+
+1. **Automatic loading**: Place a file named `trdos.rom` in the same directory as the emulator. It will be loaded automatically when disk images are used.
+
+2. **Manual loading**: Use the `--trdos-rom` option:
+   ```bash
+   ./minzx disk.trd --trdos-rom /path/to/trdos.rom
+   ```
+
+3. **Automatic ROM switching**: The emulator automatically activates TR-DOS ROM when the program counter (PC) enters the TR-DOS entry point range (0x3D00-0x3DFF). This happens automatically when:
+   - TR-DOS routines are called from BASIC or machine code
+   - The system boots into TR-DOS
+   - Disk operations are performed
+
+4. **Manual toggle** (optional): Press **F9** to manually override the automatic switching. This is mainly for debugging purposes.
+
+#### How it works
+
+- **Automatic activation**: When `PC & 0xFF00 == 0x3D00`, TR-DOS ROM is mapped
+- **Automatic deactivation**: When PC leaves the 0x3D00-0x3DFF range, ZX Spectrum ROM is restored
+- **Seamless switching**: The change happens transparently during execution
+
+#### Where to get TR-DOS ROM
+
+TR-DOS ROMs are available from various ZX Spectrum resource sites. Common versions include:
+- TR-DOS 5.03 (most compatible)
+- TR-DOS 5.04T
+- TR-DOS 6.10
+
+**Note**: The TR-DOS ROM file should be exactly 16384 bytes (16KB).
+
+## Disk Image Formats
+
+### TRD Format
+- Standard TR-DOS disk image
+- Typically 40 or 80 tracks, double-sided
+- 16 sectors per track, 256 bytes per sector
+- Contains file catalog and disk information
+- Full read/write support
+
+### SCL Format  
+- Archive format containing multiple TR-DOS files
+- Automatically converted to TRD on load
+- **Read-only** - changes are not saved back to SCL
+- Useful for distributing game collections
+
+## Creating Test Disk Images
+
+You can create TRD images using tools like:
+- **ZXSP** - ZX Spectrum emulator with disk image creation
+- **Fuse** - Free Unix Spectrum Emulator
+- **TRDtool** - Command-line utility for TRD manipulation
+
+## Known Limitations
+
+- SCL images are read-only (write support would require re-packing to SCL format)
+- Runtime disk mounting/unmounting not implemented (restart to change disks)
+- No disk creation from within emulator
+- TR-DOS ROM switching is automatic based on PC address (0x3D00-0x3DFF range)
+
+## Testing
+
+To test disk support:
+
+1. Create or obtain a .TRD disk image
+2. Obtain a TR-DOS ROM (trdos.rom) - place it in the same directory as minzx
+3. Run: `./minzx test.trd`
+4. The TR-DOS ROM will be loaded automatically
+5. TR-DOS ROM will activate automatically when the system calls TR-DOS routines (PC in 0x3D00-0x3DFF)
+6. Press F8 to see disk catalog
+
+### Using TR-DOS
+
+The TR-DOS ROM activates automatically when needed. Typical workflow:
+
+1. Start the emulator with a disk image: `./minzx game.trd`
+2. The system boots into ZX Spectrum BASIC
+3. Use BASIC commands that access disk (e.g., `LOAD`, `CAT`, `RUN`)
+4. When TR-DOS routines are called (PC enters 0x3D00-0x3DFF), the ROM automatically switches
+5. After TR-DOS operations complete, the ROM switches back to ZX Spectrum
+
+**Note**: The ROM switching is fully automatic based on the program counter. You don't need to manually toggle ROMs.
+
+### Example Session
+
+```bash
+# Start with a disk image and TR-DOS ROM in current directory
+./minzx game.trd
+
+# System boots into ZX Spectrum BASIC
+# Type in BASIC:
+CAT        # TR-DOS ROM activates automatically, shows disk catalog
+RUN "game" # Loads and runs game from disk
+
+# ROM switching happens transparently
+# F9 can be used for manual override if needed (debugging)
+```
+
+## License
+
+See LICENSE file.
+
+## Credits
+
+- Z80 emulation based on concepts from José Luis Sánchez's z80cpp
+- TR-DOS support implementation for MinZX_SDL
 

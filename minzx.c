@@ -10,10 +10,11 @@
  * - BRIGHT aplicado a ink y paper
  * - Puerto FE: bit 6 = EAR (tape); bit 7 = espejo de bit 3 del último OUT
  * - Beeper/speaker por eventos con timestamp (T-states) → audio estable
+ * - Soporte TR-DOS: imágenes .TRD y .SCL con emulación WD1793 FDC
  *
- * Compilar LINUX:     gcc minzx.c jgz80/z80.c -o minzx -lSDL2 -lm
- * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
- * Uso: ./minzx [cinta.tap | cinta.tzx | snapshot.sna]
+ * Compilar LINUX:     gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx -lSDL2 -lm
+ * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
+ * Uso: ./minzx [archivo.tap|tzx|sna|trd|scl] [--ro] [--trdos-rom file.rom] [--drive-count N]
  */
 
 #include <SDL2/SDL.h>
@@ -28,6 +29,9 @@
 #endif
 
 #include "jgz80/z80.h"
+#include "disk/trd.h"
+#include "disk/scl.h"
+#include "disk/fdc.h"
 
 #define SCREEN_WIDTH   256
 #define SCREEN_HEIGHT  192
@@ -62,6 +66,19 @@ uint8_t keyboard[8]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 int      cycles_done   = 0;     // puede replegarse por frame
 uint64_t global_cycles = 0;     // SIEMPRE crece → referencia para cinta/audio
+
+// ─────────────────────────────────────────────────────────────
+// TR-DOS / FDC
+// ─────────────────────────────────────────────────────────────
+fdc_t fdc;
+trd_image_t* disk_images[4] = {NULL, NULL, NULL, NULL};
+scl_image_t* scl_images[4] = {NULL, NULL, NULL, NULL};
+bool trdos_enabled = false;
+
+// TR-DOS ROM support
+uint8_t trdos_rom[ROM_SIZE];
+bool trdos_rom_loaded = false;
+bool trdos_rom_active = false;  // true when TR-DOS ROM is mapped
 
 // Configuración de audio
 SDL_AudioDeviceID audio_dev;
@@ -1172,6 +1189,21 @@ uint8_t read_byte(void* ud, uint16_t addr) {
     }
 #endif
     (void)ud;
+    
+    // Automatic TR-DOS ROM activation when PC is in 0x3D00-0x3DFF range
+    if (trdos_rom_loaded) {
+        if ((cpu.pc & 0xFF00) == 0x3D00) {
+            trdos_rom_active = true;
+        } else if ((cpu.pc & 0xFF00) != 0x3D00 && trdos_rom_active) {
+            trdos_rom_active = false;
+        }
+    }
+    
+    // If TR-DOS ROM is active and address is in ROM area, read from TR-DOS ROM
+    if (trdos_rom_active && addr < ROM_SIZE && trdos_rom_loaded) {
+        return trdos_rom[addr];
+    }
+    
     return memory[addr];
 }
 
@@ -1198,7 +1230,14 @@ uint8_t port_in(z80* z, uint16_t port) {
 		printf("puerto %d\n", (port&0xff));
 	}*/
 
-	
+	// Check for FDC ports first (if TR-DOS enabled)
+    if (trdos_enabled) {
+        uint8_t port_low = port & 0xFF;
+        if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
+            port_low == 0x7F || port_low == 0xFF) {
+            return fdc_port_in(&fdc, port);
+        }
+    }
 
     if ((port & 1) == 0) { // FE
 		res = 0xbf;
@@ -1258,6 +1297,17 @@ uint8_t port_in(z80* z, uint16_t port) {
 void port_out(z80* z, uint16_t port, uint8_t val) {
     (void)z;
 	//printf("out %d=%d", port, val);
+	
+	// Check for FDC ports first (if TR-DOS enabled)
+    if (trdos_enabled) {
+        uint8_t port_low = port & 0xFF;
+        if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
+            port_low == 0x7F || port_low == 0xFF) {
+            fdc_port_out(&fdc, port, val);
+            return;
+        }
+    }
+	
     if ((port & 1) == 0) {
         border_color   = val & 0x07;
         last_fe_write  = val;
@@ -1280,6 +1330,19 @@ bool load_rom(const char* fn) {
     size_t rd = fread(memory, 1, ROM_SIZE, f);
     fclose(f);
     return rd == ROM_SIZE;
+}
+
+bool load_trdos_rom(const char* fn) {
+    FILE* f = fopen(fn, "rb");
+    if (!f) return false;
+    size_t rd = fread(trdos_rom, 1, ROM_SIZE, f);
+    fclose(f);
+    if (rd == ROM_SIZE) {
+        trdos_rom_loaded = true;
+        printf("TR-DOS ROM loaded: %s\n", fn);
+        return true;
+    }
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1365,6 +1428,40 @@ void handle_input() {
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F7) {
             if (tape_filename) {
                 tape.playing=!tape.playing;
+            }
+        }
+        
+        // F8: List disk images and files
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F8) {
+            if (trdos_enabled) {
+                printf("\n=== Disk Status ===\n");
+                for (int i = 0; i < 4; i++) {
+                    printf("Drive %d: ", i);
+                    if (disk_images[i]) {
+                        printf("%s\n", disk_images[i]->filename);
+                        trd_list_files(disk_images[i]);
+                    } else if (scl_images[i]) {
+                        printf("%s (SCL)\n", scl_images[i]->filename);
+                        if (scl_images[i]->trd) {
+                            trd_list_files(scl_images[i]->trd);
+                        }
+                    } else {
+                        printf("(empty)\n");
+                    }
+                }
+            } else {
+                printf("TR-DOS not enabled\n");
+            }
+        }
+        
+        // F9: Toggle TR-DOS ROM (manual override)
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F9) {
+            if (trdos_rom_loaded) {
+                trdos_rom_active = !trdos_rom_active;
+                printf("TR-DOS ROM: %s (manual override)\n", trdos_rom_active ? "ACTIVE" : "INACTIVE");
+                printf("Note: ROM auto-switches when PC is in 0x3D00-0x3DFF range\n");
+            } else {
+                printf("TR-DOS ROM not loaded\n");
             }
         }
 
@@ -1505,6 +1602,23 @@ bool load_tap(const char* filename) {
 // Main
 // ─────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+    bool read_only_disks = false;
+    int drive_count = 2; // Default 2 drives
+    int next_drive = 0;
+    const char* trdos_rom_file = NULL;
+    
+    // Parse command-line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ro") == 0) {
+            read_only_disks = true;
+        } else if (strcmp(argv[i], "--drive-count") == 0 && i + 1 < argc) {
+            drive_count = atoi(argv[++i]);
+            if (drive_count < 1 || drive_count > 4) drive_count = 2;
+        } else if (strcmp(argv[i], "--trdos-rom") == 0 && i + 1 < argc) {
+            trdos_rom_file = argv[++i];
+        }
+    }
+    
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -1525,7 +1639,7 @@ int main(int argc, char** argv) {
         SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
 
-    window = SDL_CreateWindow("Minimal ZX 48K",
+    window = SDL_CreateWindow(trdos_enabled ? "Minimal ZX 48K + TR-DOS" : "Minimal ZX 48K",
                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                               FULL_WIDTH * SCALE, FULL_HEIGHT * SCALE, 0);
 
@@ -1537,6 +1651,16 @@ int main(int argc, char** argv) {
 
     if (!load_rom("zx48.rom")) { fprintf(stderr, "No se encuentra zx48.rom\n"); return 1; }
 
+    // Try to load TR-DOS ROM if specified or if trdos.rom exists
+    if (trdos_rom_file) {
+        if (!load_trdos_rom(trdos_rom_file)) {
+            fprintf(stderr, "Warning: Could not load TR-DOS ROM: %s\n", trdos_rom_file);
+        }
+    } else {
+        // Try to load trdos.rom from current directory by default
+        load_trdos_rom("trdos.rom");
+    }
+
     z80_init(&cpu);
     cpu.read_byte  = read_byte;
     cpu.write_byte = write_byte;
@@ -1545,20 +1669,62 @@ int main(int argc, char** argv) {
     cpu.pc = 0x0000;
     cpu.sp = 0x0000;
     cpu.interrupt_mode = 1;
+    
+    // Initialize FDC
+    fdc_init(&fdc);
 
 
     int frame_counter = 0;
     int flash_phase = 0;
 
-    if (argc > 1) {
-        const char* ext = strrchr(argv[1], '.');
-        if (ext && strcasecmp(ext, ".tap") == 0) {
-            load_tap(argv[1]);
-        } else if (ext && strcasecmp(ext, ".sna") == 0) {
-            load_sna(argv[1]);
-        } else if (ext && strcasecmp(ext, ".tzx") == 0) {
-            load_tzx(argv[1]);
+    // Load files from command line
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-') {
+            // Skip options
+            if (strcmp(argv[i], "--drive-count") == 0 || strcmp(argv[i], "--trdos-rom") == 0) {
+                i++; // Skip option argument
+            }
+            continue;
         }
+        
+        const char* ext = strrchr(argv[i], '.');
+        if (!ext) continue;
+        
+        if (strcasecmp(ext, ".tap") == 0) {
+            load_tap(argv[i]);
+        } else if (strcasecmp(ext, ".sna") == 0) {
+            load_sna(argv[i]);
+        } else if (strcasecmp(ext, ".tzx") == 0) {
+            load_tzx(argv[i]);
+        } else if (strcasecmp(ext, ".trd") == 0) {
+            // Mount TRD image
+            if (next_drive < drive_count) {
+                trd_image_t* img = trd_open(argv[i], read_only_disks);
+                if (img) {
+                    disk_images[next_drive] = img;
+                    fdc_attach_image(&fdc, next_drive, img);
+                    printf("Mounted TRD to drive %d\n", next_drive);
+                    next_drive++;
+                    trdos_enabled = true;
+                }
+            }
+        } else if (strcasecmp(ext, ".scl") == 0) {
+            // Mount SCL image
+            if (next_drive < drive_count) {
+                scl_image_t* img = scl_open(argv[i]);
+                if (img) {
+                    scl_images[next_drive] = img;
+                    fdc_attach_image(&fdc, next_drive, scl_get_trd(img));
+                    printf("Mounted SCL to drive %d\n", next_drive);
+                    next_drive++;
+                    trdos_enabled = true;
+                }
+            }
+        }
+    }
+    
+    if (trdos_enabled) {
+        printf("\nTR-DOS enabled. Keys: F8=List disks, F12=Reset\n");
     }
 
     while (true) {
@@ -1566,6 +1732,12 @@ int main(int argc, char** argv) {
         
         for (int line = 0; line < FULL_HEIGHT; line++) {
             z80_step_n(&cpu, 224);
+            
+            // Step FDC if TR-DOS enabled
+            if (trdos_enabled) {
+                fdc_step(&fdc, 224);
+            }
+            
             displayscanline(line, flash_phase);
             
             cycles_done   += (224);

@@ -5,3 +5,19 @@ build
 *.pdb
 *.opensdf
 *.suo
+*.o
+minzx
+minzx.exe
+
+# Test files
+*.trd
+*.scl
+*.tap
+*.tzx
+*.sna
+*.rom
+
+# Temporary files
+/tmp/*
+.DS_Store
+*~
