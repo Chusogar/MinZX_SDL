@@ -19,12 +19,12 @@
  *   - Bit 3: Video page select (not implemented)
  *   - Bit 4: ROM select (0 = 48K, 1 = 128K)
  *   - Bit 5: Paging disable (locks configuration)
- * - AY-3-8912 sound chip (placeholder):
+ * - AY-3-8912 sound chip (full t-state precise emulation):
  *   - Port 0xFFFD: Register select
  *   - Port 0xBFFD: Data write/read
  *
- * Compilar LINUX:     gcc minzx.c jgz80/z80.c -o minzx -lSDL2 -lm
- * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
+ * Compilar LINUX:     gcc minzx.c jgz80/z80.c ay/ay.c disk/trd.c disk/scl.c disk/fdc.c -o minzx -lSDL2 -lm
+ * Compilar WIN/MSYS2: gcc minzx.c jgz80/z80.c ay/ay.c disk/trd.c disk/scl.c disk/fdc.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
  * Uso: ./minzx [--128k] [cinta.tap | cinta.tzx | snapshot.sna]
  */
 
@@ -44,6 +44,7 @@
 #include "disk/trd.h"
 #include "disk/scl.h"
 #include "disk/fdc.h"
+#include "ay/ay.h"
 
 #define SCREEN_WIDTH   256
 #define SCREEN_HEIGHT  192
@@ -74,9 +75,8 @@ uint8_t rom_banks[ROM_BANKS][ROM_SIZE];       // 2 ROM banks of 16KB each
 uint8_t port_7ffd = 0x00;                      // Memory paging register
 int paging_disabled = 0;                       // Bit 5 of port 7FFD locks paging
 
-// AY-3-8912 sound chip (placeholder)
-uint8_t ay_register_selected = 0;
-uint8_t ay_registers[16] = {0};
+// AY-3-8912 selected register (mirrors the internal state for port reads)
+uint8_t ay_selected_register = 0;
 
 // ─────────────────────────────────────────────────────────────
 // TR-DOS / FDC
@@ -1186,13 +1186,16 @@ void generate_audio(uint32_t current_tstates) {
     for (int i = 0; i < samples_to_render; i++) {
         if (audio_ptr < BUFFER_SIZE) 
         {
-            // Amplificamos el bit (0 o 1) a un valor de 16 bits
+            // Amplificamos el bit (0 o 1) a un valor de 16 bits (beeper)
             audio_buffer[audio_ptr++] = current_speaker_level ? 8000 : -8000;
         }
 
         // Si el buffer se llena, lo enviamos a SDL
         if (audio_ptr >= BUFFER_SIZE) 
         {
+            // Mix AY output with beeper output
+            ay_mix_samples(audio_buffer, BUFFER_SIZE);
+            
             SDL_QueueAudio(audio_dev, audio_buffer, BUFFER_SIZE * sizeof(int16_t));
             audio_ptr = 0;
         }
@@ -1365,11 +1368,9 @@ uint8_t port_in(z80* z, uint16_t port) {
 			}
 		}
 
-		// AY-3-8912 sound chip data read (port 0xFFFD in 128K mode)
-		if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
-			if (ay_register_selected < 16) {
-				return ay_registers[ay_register_selected];
-			}
+		// AY-3-8912 sound chip data read (port 0xBFFD in 128K mode)
+		if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
+			return ay_read_reg(ay_selected_register);
 		}
 
 	}
@@ -1438,20 +1439,18 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         }
     }
     
-    // AY-3-8912 sound chip registers (placeholder)
+    // AY-3-8912 sound chip registers
     // Port 0xFFFD: Register select
     if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
-        ay_register_selected = val & 0x0F;  // Only 16 registers
-        if (_debug) printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_register_selected);
+        ay_selected_register = val & 0x0F;  // Only 16 registers
+        ay_select_register(ay_selected_register);
+        if (_debug) printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_selected_register);
     }
     
     // Port 0xBFFD: Data write
     if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
-        if (ay_register_selected < 16) {
-            ay_registers[ay_register_selected] = val;
-            if (_debug) printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_register_selected, val);
-            // Placeholder: Actual AY-3-8912 sound generation would go here
-        }
+        ay_write_reg(ay_selected_register, val);
+        if (_debug) printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_selected_register, val);
     }
 }
 
@@ -1572,6 +1571,9 @@ void zx_reset(void) {
         paging_disabled = 0;
         printf("Bancos RAM 128K inicializados\n");
     }
+    
+    // Reset AY-3-8912
+    ay_reset();
 }
 
 void load_bios(void) {
@@ -1857,6 +1859,10 @@ int main(int argc, char** argv) {
     } else {
         SDL_PauseAudioDevice(audio_dev, 0); // Empieza a reproducir (silencio inicial)
     }
+    
+    // Initialize AY-3-8912 sound chip
+    ay_init(CPU_HZ, SAMPLE_RATE, true);
+    if (_debug) printf("[AY] Inicializado: CPU=%u Hz, Sample Rate=%u Hz\n", CPU_HZ, SAMPLE_RATE);
 
     const char* window_title = is_128k_mode ? "Minimal ZX 128K" : "Minimal ZX 48K";
     window = SDL_CreateWindow(window_title,
@@ -1929,6 +1935,7 @@ int main(int argc, char** argv) {
         
         for (int line = 0; line < FULL_HEIGHT; line++) {
             z80_step_n(&cpu, 224);
+            ay_step(224);  // Advance AY emulation by same number of t-states
             displayscanline(line, flash_phase);
             
             cycles_done   += (224);
