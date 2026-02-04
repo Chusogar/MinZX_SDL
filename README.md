@@ -25,7 +25,7 @@ Using a simple jgz80 Z80 emulator core (based on concepts from [z80cpp](https://
 - Keyboard input
 - Audio/beeper emulation
 - Video with proper border, BRIGHT attribute support
-- AY-3-8912 sound chip (placeholder)
+- **AY-3-8912 sound chip emulation** (t-state precise, 3 tone channels + noise + envelope)
 - Floating bus emulation support
 
 ### TR-DOS Disk Support
@@ -46,7 +46,12 @@ TR-DOS works in both 48K and 128K modes!
   - Bit 3: Video page select (not implemented yet)
   - Bit 4: ROM select (0 = 48K, 1 = 128K)
   - Bit 5: Paging disable (locks configuration)
-- AY-3-8912 sound chip emulation (placeholder)
+- **AY-3-8912 sound chip emulation**
+  - Full t-state precise emulation
+  - 3 tone channels, noise generator, envelope generator
+  - Port 0xFFFD: Register select
+  - Port 0xBFFD: Data read/write
+  - Mixed with beeper audio output at 44100 Hz
 
 #### FDC Emulation
 
@@ -60,12 +65,12 @@ TR-DOS works in both 48K and 128K modes!
 
 ### Linux
 ```bash
-gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx -lSDL2 -lm
+gcc minzx.c jgz80/z80.c ay/ay.c disk/trd.c disk/scl.c disk/fdc.c -o minzx -lSDL2 -lm
 ```
 
 ### Windows (MSYS2)
 ```bash
-gcc minzx.c jgz80/z80.c disk/trd.c disk/scl.c disk/fdc.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
+gcc minzx.c jgz80/z80.c ay/ay.c disk/trd.c disk/scl.c disk/fdc.c -o minzx.exe -lmingw32 -lSDL2main -lSDL2
 ```
 
 ### Visual Studio
@@ -191,7 +196,6 @@ You can create TRD images using tools like:
 - No disk creation from within emulator
 - TR-DOS ROM switching is automatic based on PC address (0x3D00-0x3DFF range)
 - 128K video page selection not yet implemented
-- AY-3-8912 sound chip is placeholder only (no actual sound generation)
 - Floating bus logic added but not fully implemented
 
 ## Combining 128K and TR-DOS

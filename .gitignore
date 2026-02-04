@@ -5,3 +5,6 @@ build
 *.pdb
 *.opensdf
 *.suo
+*.o
+minzx
+minzx.exe
