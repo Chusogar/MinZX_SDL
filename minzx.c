@@ -41,6 +41,10 @@
 
 #include "jgz80/z80.h"
 
+#include "disk/trd.h"
+#include "disk/scl.h"
+#include "disk/fdc.h"
+
 #define SCREEN_WIDTH   256
 #define SCREEN_HEIGHT  192
 #define SCALE          1
@@ -56,19 +60,14 @@
 #define MEMORY_SIZE    (64*1024)
 #define CYCLES_PER_FRAME 69888
 
-// 128K Memory layout
+// ─────────────────────────────────────────────────────────────
+// ZX Spectrum 128K Support
+// ─────────────────────────────────────────────────────────────
 #define RAM_BANKS      8
 #define RAM_BANK_SIZE  16384
 #define ROM_BANKS      2
 #define TOTAL_RAM_SIZE (RAM_BANKS * RAM_BANK_SIZE)  // 128KB
 
-// ─────────────────────────────────────────────────────────────
-// Globals
-// ─────────────────────────────────────────────────────────────
-uint8_t memory[MEMORY_SIZE];
-z80 cpu;
-
-// 128K specific memory
 int is_128k_mode = 0;                          // 0 = 48K, 1 = 128K
 uint8_t ram_banks[RAM_BANKS][RAM_BANK_SIZE];  // 8 banks of 16KB each
 uint8_t rom_banks[ROM_BANKS][ROM_SIZE];       // 2 ROM banks of 16KB each
@@ -78,6 +77,28 @@ int paging_disabled = 0;                       // Bit 5 of port 7FFD locks pagin
 // AY-3-8912 sound chip (placeholder)
 uint8_t ay_register_selected = 0;
 uint8_t ay_registers[16] = {0};
+
+// ─────────────────────────────────────────────────────────────
+// TR-DOS / FDC
+// ─────────────────────────────────────────────────────────────
+fdc_t fdc;
+trd_image_t* disk_images[4] = {NULL, NULL, NULL, NULL};
+scl_image_t* scl_images[4] = {NULL, NULL, NULL, NULL};
+bool trdos_enabled = false;
+
+// TR-DOS ROM support
+uint8_t trdos_rom[ROM_SIZE];
+bool trdos_rom_loaded = false;
+bool trdos_rom_active = false;  // true when TR-DOS ROM is mapped
+
+bool _debug = false;
+
+// ─────────────────────────────────────────────────────────────
+// Globals
+// ─────────────────────────────────────────────────────────────
+uint8_t memory[MEMORY_SIZE];
+z80 cpu;
+
 
 SDL_Window*   window   = NULL;
 SDL_Renderer* renderer = NULL;
@@ -92,19 +113,6 @@ uint8_t keyboard[8]    = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 int      cycles_done   = 0;     // puede replegarse por frame
 uint64_t global_cycles = 0;     // SIEMPRE crece → referencia para cinta/audio
 
-// Floating bus support - scanline and ULA fetch tracking
-#define TOTAL_SCANLINES      312
-#define TOP_BORDER_LINES     64
-#define VISIBLE_LINES        192
-#define TSTATES_PER_SCANLINE 224
-#define TSTATES_ACTIVE_FETCH 128
-
-int      current_scanline = 0;       // 0..311
-uint32_t tstates_this_line = 0;
-int      ula_fetch_phase = -1;       // -1 = idle, 0..15 = slot activo
-bool     is_in_visible_area = false;
-uint16_t current_video_address = 0;
-
 // Configuración de audio
 SDL_AudioDeviceID audio_dev;
 SDL_AudioSpec want;
@@ -118,6 +126,7 @@ uint32_t last_audio_tstates = 0; // T-states acumulados desde la última muestra
 int16_t audio_buffer[BUFFER_SIZE];
 int audio_ptr = 0;
 uint8_t current_speaker_level = 0; // Estado actual del bit 4 de 0xFE
+
 
 
 // Colores ZX con alfa (0xAARRGGBB)
@@ -1214,6 +1223,20 @@ uint8_t read_byte(void* ud, uint16_t addr) {
     }
 #endif
     (void)ud;
+
+	// Automatic TR-DOS ROM activation when PC is in 0x3D00-0x3DFF range
+    if (trdos_rom_loaded /*&& !is_128k_mode*/) {
+        if ((cpu.pc & 0xFF00) == 0x3D00) {
+            trdos_rom_active = true;
+        } else if ((cpu.pc >= 0x4000) && trdos_rom_active) {
+            trdos_rom_active = false;
+        }
+    }
+    
+    // TR-DOS ROM has priority (works in both 48K and 128K modes)
+    if (trdos_rom_active && addr < ROM_SIZE && trdos_rom_loaded /*&&!is_128k_mode*/) {
+        return trdos_rom[addr];
+    }
     
     if (!is_128k_mode) {
         return memory[addr];
@@ -1276,64 +1299,6 @@ void write_byte(void* ud, uint16_t addr, uint8_t val) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Floating Bus - ULA fetch state tracking
-// ─────────────────────────────────────────────────────────────
-void update_ula_fetch_state() {
-    // Calculate T-states within current scanline
-    uint32_t t_in_line = cycles_done % TSTATES_PER_SCANLINE;
-    
-    // Check if we're in the visible area (scanlines 64-255)
-    if (current_scanline < TOP_BORDER_LINES || 
-        current_scanline >= TOP_BORDER_LINES + VISIBLE_LINES) {
-        is_in_visible_area = false;
-        ula_fetch_phase = -1;
-        current_video_address = 0;
-        return;
-    }
-    
-    is_in_visible_area = true;
-    
-    // Check if we're past the active fetch period (128 T-states)
-    if (t_in_line >= TSTATES_ACTIVE_FETCH) {
-        ula_fetch_phase = -1;
-        current_video_address = 0;
-        return;
-    }
-    
-    // Calculate fetch slot (0-15) and sub-T-state within slot (0-7)
-    int slot = t_in_line / 8;
-    int sub_t = t_in_line % 8;
-    
-    // ULA only fetches during first 4 T-states of each 8 T-state slot
-    if (sub_t >= 4) {
-        ula_fetch_phase = -1;
-        current_video_address = 0;
-        return;
-    }
-    
-    ula_fetch_phase = slot;
-    
-    // Calculate which character column (0-31) and whether we're fetching attribute
-    int char_x = slot * 2 + (sub_t / 2);
-    bool is_attr = (sub_t % 2) == 1;
-    
-    // Calculate Y coordinate in visible area (0-191)
-    int spe_y = current_scanline - TOP_BORDER_LINES;
-    
-    // Calculate ULA's Y coordinate (with line interleaving)
-    // Y = bits 7-6 | bits 2-0 | bits 5-3
-    int ula_y = ((spe_y & 0xC0) | ((spe_y & 0x38) >> 3) | ((spe_y & 0x07) << 3));
-    
-    if (is_attr) {
-        // Attribute: 0x5800 + (Y/8)*32 + X
-        current_video_address = 0x5800 + ((spe_y >> 3) << 5) + char_x;
-    } else {
-        // Pixel data: 0x4000 + ULA_Y*32 + X
-        current_video_address = 0x4000 + (ula_y << 5) + char_x;
-    }
-}
-
 uint8_t port_in(z80* z, uint16_t port) {
     (void)z;
     uint8_t res = 0xFF;
@@ -1390,34 +1355,28 @@ uint8_t port_in(z80* z, uint16_t port) {
 
   #endif
         
-        return res;  // Port 0xFE handled - return directly
-    } 
-    
-    // Joystick Kempston
-    if ((port & 0xff) == 0x1f) {
-		return 0xff;
+    } else {
+		if (trdos_enabled) {
+			uint8_t port_low = port & 0xFF;
+			if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
+				port_low == 0x7F || port_low == 0xFF) {
+				printf("TRDOS IN: %X\n", port);
+				return fdc_port_in(&fdc, port);
+			}
+		}
+
+		// AY-3-8912 sound chip data read (port 0xFFFD in 128K mode)
+		if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
+			if (ay_register_selected < 16) {
+				return ay_registers[ay_register_selected];
+			}
+		}
+
 	}
     
-    // AY-3-8912 sound chip data read (port 0xFFFD in 128K mode)
-    if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
-        if (ay_register_selected < 16) {
-            return ay_registers[ay_register_selected];
-        }
-    }
     
-    // Floating bus para puertos no decodificados
-    update_ula_fetch_state();
-    
-    if (!is_in_visible_area || ula_fetch_phase < 0) {
-        return 0xFF;  // Not in visible area or not during fetch
-    }
-    
-    // Return the video memory byte that ULA is currently fetching
-    if (is_128k_mode) {
-        return read_byte(NULL, current_video_address);
-    } else {
-        return memory[current_video_address];
-    }
+
+    return res;
 }
 
 
@@ -1435,7 +1394,18 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         
         // El bit 4 controla el altavoz
         current_speaker_level = (val & 0x10) ? 1 : 0;
-    }
+    } else {
+		if (trdos_enabled) {
+			uint8_t port_low = port & 0xFF;
+			if (port_low == 0x1F || port_low == 0x3F || port_low == 0x5F || 
+				port_low == 0x7F || port_low == 0xFF) {
+				printf("TRDOS OUT: %X Val=%d\n", port_low, val);
+				fdc_port_out(&fdc, port, val);
+				//return;
+			}
+		} 
+	}
+
     
     // 128K memory paging (port 0x7FFD)
     if (is_128k_mode && (port & 0xC002) == 0x4000) {  // Port 0x7FFD
@@ -1446,16 +1416,16 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
             // Bit 5: If set, disable further paging (until reset)
             if (val & 0x20) {
                 paging_disabled = 1;
-                printf("[128K] Paginación bloqueada por escritura en puerto 0x7FFD: 0x%02X\n", val);
+                if (_debug) printf("[128K] Paginación bloqueada por escritura en puerto 0x7FFD: 0x%02X\n", val);
             }
             
             // Debug logging for bank switches
             if ((old_port_7ffd & 0x07) != (val & 0x07)) {
-                printf("[128K] Banco RAM en 0xC000 cambiado de %d a %d\n", 
+                if (_debug) printf("[128K] Banco RAM en 0xC000 cambiado de %d a %d\n", 
                        old_port_7ffd & 0x07, val & 0x07);
             }
             if ((old_port_7ffd & 0x10) != (val & 0x10)) {
-                printf("[128K] Banco ROM cambiado a %s\n", 
+                if (_debug) printf("[128K] Banco ROM cambiado a %s\n", 
                        (val & 0x10) ? "ROM 1 (editor 128K)" : "ROM 0 (BASIC 48K)");
             }
             
@@ -1464,7 +1434,7 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
             // Bit 4: ROM select (0 = 48K ROM, 1 = 128K ROM)
             // Bit 5: Paging disable
         } else {
-            printf("[128K] Escritura de paginación ignorada (bloqueada): puerto=0x%04X val=0x%02X\n", port, val);
+            if (_debug) printf("[128K] Escritura de paginación ignorada (bloqueada): puerto=0x%04X val=0x%02X\n", port, val);
         }
     }
     
@@ -1472,14 +1442,14 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
     // Port 0xFFFD: Register select
     if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
         ay_register_selected = val & 0x0F;  // Only 16 registers
-        printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_register_selected);
+        if (_debug) printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_register_selected);
     }
     
     // Port 0xBFFD: Data write
     if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
         if (ay_register_selected < 16) {
             ay_registers[ay_register_selected] = val;
-            printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_register_selected, val);
+            if (_debug) printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_register_selected, val);
             // Placeholder: Actual AY-3-8912 sound generation would go here
         }
     }
@@ -1506,6 +1476,19 @@ bool load_128k_rom(const char* fn) {
     fclose(f);
     
     return (rd0 == ROM_SIZE && rd1 == ROM_SIZE);
+}
+
+bool load_trdos_rom(const char* fn) {
+    FILE* f = fopen(fn, "rb");
+    if (!f) return false;
+    size_t rd = fread(trdos_rom, 1, ROM_SIZE, f);
+    fclose(f);
+    if (rd == ROM_SIZE) {
+        trdos_rom_loaded = true;
+        printf("TR-DOS ROM loaded: %s\n", fn);
+        return true;
+    }
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1567,6 +1550,57 @@ void update_texture() {
     SDL_RenderPresent(renderer);
 }
 
+void zx_reset(void) {
+	printf("RESET!\n");
+	z80_init(&cpu);
+    cpu.read_byte  = read_byte;
+    cpu.write_byte = write_byte;
+    cpu.port_in    = port_in;
+    cpu.port_out   = port_out;
+    cpu.pc = 0x0000;
+    cpu.sp = 0x0000;
+    cpu.interrupt_mode = 1;
+
+    // Initialize RAM banks in 128K mode
+    if (is_128k_mode) {
+        // Clear all RAM banks
+        for (int i = 0; i < RAM_BANKS; i++) {
+            memset(ram_banks[i], 0, RAM_BANK_SIZE);
+        }
+        // Initialize paging: Bank 0 at 0xC000, ROM 0 selected
+        port_7ffd = 0x00;
+        paging_disabled = 0;
+        printf("Bancos RAM 128K inicializados\n");
+    }
+}
+
+void load_bios(void) {
+	// Load appropriate ROM
+    if (is_128k_mode) {
+        if (!load_128k_rom("zx128.rom")) { 
+            fprintf(stderr, "No se encuentra zx128.rom, intentando zx48.rom en 128K mode\n");
+            // Fallback: load 48K ROM into both banks
+            if (!load_rom("zx48.rom")) {
+                fprintf(stderr, "No se encuentra zx48.rom\n"); 
+                return;
+            }
+            // Copy 48K ROM to both 128K ROM banks
+            memcpy(rom_banks[0], memory, ROM_SIZE);
+            memcpy(rom_banks[1], memory, ROM_SIZE);
+        }
+        printf("Ejecutando en modo 128K\n");
+    } else {
+        if (!load_rom("zx48.rom")) { 
+            fprintf(stderr, "No se encuentra zx48.rom\n"); 
+            return; 
+        }
+        printf("Ejecutando en modo 48K\n");
+    }
+
+	//TR-DOS
+	load_trdos_rom("trdos.rom");
+}
+
 
 // ─────────────────────────────────────────────────────────────
 // Teclado (eventos)
@@ -1577,8 +1611,13 @@ void handle_input() {
         if (e.type == SDL_QUIT || (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE))
             exit(0);
 
-        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12)
-            z80_reset(&cpu);
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12){
+            //z80_reset(&cpu);
+			//port_7ffd = 0x00;                      // Memory paging register
+			//paging_disabled = 0;
+			zx_reset();
+			load_bios();
+		}
 
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F6) {
             if (tape_filename) {
@@ -1594,8 +1633,32 @@ void handle_input() {
             }
         }
 
-        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12)
+		// F8: List disk images and files
+        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F8) {
+            if (trdos_enabled) {
+                printf("\n=== Disk Status ===\n");
+                for (int i = 0; i < 4; i++) {
+                    printf("Drive %d: ", i);
+                    if (disk_images[i]) {
+                        printf("%s\n", disk_images[i]->filename);
+                        trd_list_files(disk_images[i]);
+                    } else if (scl_images[i]) {
+                        printf("%s (SCL)\n", scl_images[i]->filename);
+                        if (scl_images[i]->trd) {
+                            trd_list_files(scl_images[i]->trd);
+                        }
+                    } else {
+                        printf("(empty)\n");
+                    }
+                }
+            } else {
+                printf("TR-DOS not enabled\n");
+            }
+        }
+
+        /*if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12)
             z80_reset(&cpu);
+		*/
 
         if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
             bool press = (e.type == SDL_KEYDOWN);
@@ -1763,14 +1826,16 @@ bool load_tap(const char* filename) {
 // Main
 // ─────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+	bool read_only_disks = false;
+    int drive_count = 2; // Default 2 drives
+    int next_drive = 0;
+
     // Parse command-line arguments
     const char* tape_file = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--128k") == 0) {
             is_128k_mode = 1;
-        } else {
-            tape_file = argv[i];
-        }
+        } 
     }
     
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
@@ -1804,79 +1869,70 @@ int main(int argc, char** argv) {
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                                 SDL_TEXTUREACCESS_STATIC, FULL_WIDTH, FULL_HEIGHT);
 
-    // Load appropriate ROM
-    if (is_128k_mode) {
-        if (!load_128k_rom("zx128.rom")) { 
-            fprintf(stderr, "No se encuentra zx128.rom, intentando zx48.rom en 128K mode\n");
-            // Fallback: load 48K ROM into both banks
-            if (!load_rom("zx48.rom")) {
-                fprintf(stderr, "No se encuentra zx48.rom\n"); 
-                return 1;
-            }
-            // Copy 48K ROM to both 128K ROM banks
-            memcpy(rom_banks[0], memory, ROM_SIZE);
-            memcpy(rom_banks[1], memory, ROM_SIZE);
-        }
-        printf("Ejecutando en modo 128K\n");
-    } else {
-        if (!load_rom("zx48.rom")) { 
-            fprintf(stderr, "No se encuentra zx48.rom\n"); 
-            return 1; 
-        }
-        printf("Ejecutando en modo 48K\n");
-    }
+    zx_reset();
 
-    z80_init(&cpu);
-    cpu.read_byte  = read_byte;
-    cpu.write_byte = write_byte;
-    cpu.port_in    = port_in;
-    cpu.port_out   = port_out;
-    cpu.pc = 0x0000;
-    cpu.sp = 0x0000;
-    cpu.interrupt_mode = 1;
-
-    // Initialize RAM banks in 128K mode
-    if (is_128k_mode) {
-        // Clear all RAM banks
-        for (int i = 0; i < RAM_BANKS; i++) {
-            memset(ram_banks[i], 0, RAM_BANK_SIZE);
-        }
-        // Initialize paging: Bank 0 at 0xC000, ROM 0 selected
-        port_7ffd = 0x00;
-        paging_disabled = 0;
-        printf("Bancos RAM 128K inicializados\n");
-    }
+	load_bios();
 
     int frame_counter = 0;
     int flash_phase = 0;
 
-    if (tape_file) {
-        const char* ext = strrchr(tape_file, '.');
-        if (ext && strcasecmp(ext, ".tap") == 0) {
-            load_tap(tape_file);
-        } else if (ext && strcasecmp(ext, ".sna") == 0) {
-            load_sna(tape_file);
-        } else if (ext && strcasecmp(ext, ".tzx") == 0) {
-            load_tzx(tape_file);
+    // Load files from command line
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-') {
+            // Skip options
+            if (strcmp(argv[i], "--drive-count") == 0 || strcmp(argv[i], "--trdos-rom") == 0) {
+                i++; // Skip option argument
+            }
+            continue;
+        }
+        
+        const char* ext = strrchr(argv[i], '.');
+        if (!ext) continue;
+        
+        if (strcasecmp(ext, ".tap") == 0) {
+			tape_file = argv[i];
+            load_tap(argv[i]);
+        } else if (strcasecmp(ext, ".sna") == 0) {
+            load_sna(argv[i]);
+        } else if (strcasecmp(ext, ".tzx") == 0) {
+			tape_file = argv[i];
+            load_tzx(argv[i]);
+        } else if (strcasecmp(ext, ".trd") == 0) {
+            // Mount TRD image
+            if (next_drive < drive_count) {
+                trd_image_t* img = trd_open(argv[i], read_only_disks);
+                if (img) {
+                    disk_images[next_drive] = img;
+                    fdc_attach_image(&fdc, next_drive, img);
+                    printf("Mounted TRD to drive %d\n", next_drive);
+                    next_drive++;
+                    trdos_enabled = true;
+                }
+            }
+        } else if (strcasecmp(ext, ".scl") == 0) {
+            // Mount SCL image
+            if (next_drive < drive_count) {
+                scl_image_t* img = scl_open(argv[i]);
+                if (img) {
+                    scl_images[next_drive] = img;
+                    fdc_attach_image(&fdc, next_drive, scl_get_trd(img));
+                    printf("Mounted SCL to drive %d\n", next_drive);
+                    next_drive++;
+                    trdos_enabled = true;
+                }
+            }
         }
     }
 
     while (true) {
         handle_input();
         
-        // Reset scanline counter at start of frame
-        current_scanline = 0;
-        
         for (int line = 0; line < FULL_HEIGHT; line++) {
-            current_scanline = line;
-            tstates_this_line = 0;
-            
             z80_step_n(&cpu, 224);
             displayscanline(line, flash_phase);
             
             cycles_done   += (224);
             global_cycles += (uint64_t)224;
-            tstates_this_line += 224;
             //generate_audio(cycles_done);
 
             if (line == (FULL_HEIGHT -1)) {z80_pulse_irq(&cpu, 1); /*generate_audio(69888);*/}
@@ -1894,7 +1950,7 @@ int main(int argc, char** argv) {
         cycles_done = 0; 
         last_audio_tstates = 0;
 
-        SDL_Delay(10);
+        //SDL_Delay(10);
     }
 
     SDL_DestroyTexture(texture);
