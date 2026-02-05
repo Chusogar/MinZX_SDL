@@ -44,6 +44,7 @@
 #include "disk/trd.h"
 #include "disk/scl.h"
 #include "disk/fdc.h"
+#include "ay/ay.h"
 
 #define SCREEN_WIDTH   256
 #define SCREEN_HEIGHT  192
@@ -75,8 +76,11 @@ uint8_t port_7ffd = 0x00;                      // Memory paging register
 int paging_disabled = 0;                       // Bit 5 of port 7FFD locks paging
 
 // AY-3-8912 sound chip (placeholder)
-uint8_t ay_register_selected = 0;
-uint8_t ay_registers[16] = {0};
+//uint8_t ay_register_selected = 0;
+//uint8_t ay_registers[16] = {0};
+
+// AY-3-8912 selected register (mirrors the internal state for port reads)
+uint8_t ay_selected_register = 0;
 
 // ─────────────────────────────────────────────────────────────
 // TR-DOS / FDC
@@ -317,7 +321,6 @@ static void list_tzx_blocks(const char* filename) {
             case 0x12: { uint16_t tone=rd_u16(f); uint16_t pulses=rd_u16(f); file_pos+=4; printf("  (tone=%u, pulses=%u)\n", tone,pulses); } break;
             case 0x11: { fseek(f, 2+2+2+2+2+2+1+2, SEEK_CUR); file_pos += 2+2+2+2+2+2+1+2; uint32_t dlen=rd_u24(f); file_pos+=3; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (turbo)\n"); } break;
             case 0x13: { uint8_t n=rd_u8(f); file_pos++; fseek(f, n*2, SEEK_CUR); file_pos+=n*2; printf("  (seq=%u)\n", n); } break;
-            case 0x14: { fseek(f, 2+2+1+2, SEEK_CUR); file_pos += 2+2+1+2; uint32_t dlen=rd_u24(f); file_pos+=3; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (pure data len=%u)\n", dlen); } break;
             case 0x15: { fseek(f, 2+2+1, SEEK_CUR); file_pos+=2+2+1; uint32_t dlen=rd_u24(f); file_pos+=3; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (direct rec len=%u)\n", dlen); } break;
             case 0x18: { uint16_t pause=rd_u16(f); uint32_t freq=rd_u32(f); uint8_t comp=rd_u8(f); uint32_t dlen=rd_u32(f); file_pos+=2+4+1+4; fseek(f,dlen,SEEK_CUR); file_pos+=dlen; printf("  (CSW: pause=%ums, %uHz, comp=%u, data=%u)\n", pause, freq, comp, dlen); } break;
             case 0x19: { uint32_t blen=rd_u32(f); file_pos+=4; fseek(f,blen,SEEK_CUR); file_pos+=blen; printf("  (GDB len=%u)\n", blen); } break;
@@ -780,29 +783,7 @@ static bool tzx_read_and_prepare_next_block(uint64_t now) {
             printf("[TZX] 0x13 pulse-seq: n=%d\n", n);
         } return true;
 
-        case 0x14: { // Pure Data
-            tape.t_bit0  = rd_u16(tape.f);    tape.file_pos += 2;
-            tape.t_bit1  = rd_u16(tape.f);    tape.file_pos += 2;
-            tape.used_bits_last = rd_u8(tape.f); tape.file_pos += 1; // en 0x14 la spec también usa 0→8
-            tape.pause_ms = rd_u16(tape.f);   tape.file_pos += 2;
-            uint32_t dlen = rd_u24(tape.f);   tape.file_pos += 3;
-            free(tape.blk); tape.blk = (uint8_t*)malloc(dlen);
-            if (!tape.blk) return false;
-            fread(tape.blk, 1, dlen, tape.f); tape.file_pos += dlen;
-            tape.blk_len = dlen;
-            tape.t_pilot = tape.t_sync1 = tape.t_sync2 = 0;
-            tape.phase = PH_DATA;
-            tape.data_pos = 0; tape.cur_bit = 7; tape.pulse_of_bit = 0;
-            tape.cur_byte = (tape.blk_len>0)? tape.blk[tape.data_pos++] : 0x00;
-            {
-                bool b = (tape.cur_byte & 0x80) != 0;
-                tape.halfwave_ts = halfwave_for_bit(b);
-            }
-            tape.level = tape.initial_level_known ? tape.initial_level : true;
-            tape.next_edge_cycle = now + tape.halfwave_ts;
-            printf("[TZX] 0x14 pure-data: len=%u bit0=%u bit1=%u usedLast=%u pause=%u\n",
-                   dlen, tape.t_bit0, tape.t_bit1, tape.used_bits_last, tape.pause_ms);
-        } return true;
+        
 
         case 0x15: { // Direct Recording
             tape.dr_tstates_per_sample = rd_u16(tape.f); tape.file_pos += 2;
@@ -1176,7 +1157,7 @@ static inline bool get_current_ear_level_from_tape(void) {
     return true; // sin cinta → EAR alto
 }
 
-void generate_audio(uint32_t current_tstates) {
+void generate_audio(uint32_t current_tstates, bool end) {
     uint32_t delta_t = current_tstates - last_audio_tstates;
     
     // Convertimos t-states a número de muestras
@@ -1191,7 +1172,7 @@ void generate_audio(uint32_t current_tstates) {
         }
 
         // Si el buffer se llena, lo enviamos a SDL
-        if (audio_ptr >= BUFFER_SIZE) 
+        if ((audio_ptr >= BUFFER_SIZE) && end)
         {
             SDL_QueueAudio(audio_dev, audio_buffer, BUFFER_SIZE * sizeof(int16_t));
             audio_ptr = 0;
@@ -1365,11 +1346,9 @@ uint8_t port_in(z80* z, uint16_t port) {
 			}
 		}
 
-		// AY-3-8912 sound chip data read (port 0xFFFD in 128K mode)
-		if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
-			if (ay_register_selected < 16) {
-				return ay_registers[ay_register_selected];
-			}
+		// AY-3-8912 sound chip data read (port 0xBFFD in 128K mode)
+		if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
+			return ay_read_reg(ay_selected_register);
 		}
 
 	}
@@ -1390,7 +1369,7 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         
         // Antes de cambiar el valor, generamos el audio con el nivel anterior
         // hasta el momento exacto del cambio (t_states actuales)
-        generate_audio(cycles_done); 
+        generate_audio(cycles_done, false); 
         
         // El bit 4 controla el altavoz
         current_speaker_level = (val & 0x10) ? 1 : 0;
@@ -1438,20 +1417,18 @@ void port_out(z80* z, uint16_t port, uint8_t val) {
         }
     }
     
-    // AY-3-8912 sound chip registers (placeholder)
+    // AY-3-8912 sound chip registers
     // Port 0xFFFD: Register select
     if (is_128k_mode && (port & 0xC002) == 0xC000) {  // Port 0xFFFD
-        ay_register_selected = val & 0x0F;  // Only 16 registers
-        if (_debug) printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_register_selected);
+        ay_selected_register = val & 0x0F;  // Only 16 registers
+        ay_select_register(ay_selected_register);
+        if (_debug) printf("[AY] Registro seleccionado: %d (puerto 0xFFFD)\n", ay_selected_register);
     }
     
     // Port 0xBFFD: Data write
     if (is_128k_mode && (port & 0xC002) == 0x8000) {  // Port 0xBFFD
-        if (ay_register_selected < 16) {
-            ay_registers[ay_register_selected] = val;
-            if (_debug) printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_register_selected, val);
-            // Placeholder: Actual AY-3-8912 sound generation would go here
-        }
+        ay_write_reg(ay_selected_register, val);
+        if (_debug) printf("[AY] Registro %d = 0x%02X (puerto 0xBFFD)\n", ay_selected_register, val);
     }
 }
 
@@ -1845,9 +1822,9 @@ int main(int argc, char** argv) {
 
     SDL_memset(&want, 0, sizeof(want));
     want.freq = SAMPLE_RATE;
-    want.format = AUDIO_S16SYS; // 16 bits con signo (endian nativo)
+    want.format = AUDIO_S16SYS;//AUDIO_U8; // 16 bits con signo (endian nativo)
     want.channels = 1;          // Mono
-    want.samples = 1024;        // Tamaño del buffer interno de SDL
+    want.samples = AUDIO_SAMPLES_PER_FRAME;        // Tamaño del buffer interno de SDL
     want.callback = NULL;       // Usaremos SDL_QueueAudio en su lugar
 
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
@@ -1946,11 +1923,11 @@ int main(int argc, char** argv) {
 
         update_texture();
 
-        generate_audio(69888);
+        generate_audio(69888, true);
         cycles_done = 0; 
         last_audio_tstates = 0;
 
-        //SDL_Delay(10);
+        SDL_Delay(20);
     }
 
     SDL_DestroyTexture(texture);
